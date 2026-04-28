@@ -67,6 +67,8 @@ def event_loop_normal(self):
 
 ## 三 ① 收请求：`recv_requests()`
 
+> 详细分析见 [`Scheduler.recv_requests()` 解析](scheduler-recv-requests.zh.md)。
+
 源码：`scheduler.py:1504-1659`。核心三部分：
 
 ### 3.1 非阻塞拉满 ZMQ buffer
@@ -106,6 +108,8 @@ for req in recv_reqs:
 
 ## 四 ② 把请求接入队列：`process_input_requests()`
 
+> 详细分析见 [`Scheduler.process_input_requests()` 解析](scheduler-process-input-requests.zh.md)。
+
 ```python
 for recv_req in recv_reqs:
     output = self._request_dispatcher(recv_req)
@@ -119,6 +123,8 @@ for recv_req in recv_reqs:
 `_request_dispatcher` 是基于类型的派发器(`scheduler.py:1277-1339`)，把 30+ 种 `*ReqInput` 对应到具体 handler。我们关心的是 `TokenizedGenerateReqInput → handle_generate_request`。
 
 ### 4.1 `handle_generate_request()`
+
+> 详细分析见 [`Scheduler.handle_generate_request()` 解析](scheduler-handle-generate-request.zh.md)。
 
 关键步骤(`scheduler.py:1827-2023`)：
 
@@ -139,6 +145,8 @@ for recv_req in recv_reqs:
 
 ### 4.2 `_add_request_to_queue()`
 
+> 详细分析见 [`Scheduler._add_request_to_queue()` 解析](scheduler-add-request-to-queue.zh.md)。
+
 按 disagg 模式不同(`scheduler.py:2058-2080`)：
 
 | 模式 | 落到哪个队列 |
@@ -154,6 +162,8 @@ NULL 模式还会 `_prefetch_kvcache(req)`——尝试把已知的 prefix 从 Hi
 ---
 
 ## 五 ③ 组 batch：`get_next_batch_to_run()`
+
+> 详细分析见 [`Scheduler.get_next_batch_to_run()` 解析](scheduler-get-next-batch-to-run.zh.md)。
 
 源码：`scheduler.py:2302-2411`。这是 SGLang **continuous batching** 的核心调度器。整体策略：
 
@@ -190,6 +200,8 @@ if self.last_batch and self.last_batch.forward_mode.is_extend():
 
 ### 5.2 优先组 prefill 新批：`get_new_batch_prefill()`
 
+> 详细分析见 [`Scheduler.get_new_batch_prefill()` 解析](scheduler-get-new-batch-prefill.zh.md)。
+
 `scheduler.py:2419` 起。简化逻辑：
 
 1. 从 `waiting_queue` 里选请求(可能用 priority、Radix prefix 长度、长度阈值等多种排序)。
@@ -215,13 +227,15 @@ else:
         ret = None                                # 完全空闲
 ```
 
-`update_running_batch()`(`scheduler.py:2669`)：清掉已完成的请求；当 KV 池吃紧时**主动 retract**(把某些请求踢出去回到 waiting，把它们的 KV 让出来)；构造 decode 用的 forward_batch 元信息。
+`update_running_batch()`(`scheduler.py:2669`)：清掉已完成的请求；当 KV 池吃紧时**主动 retract**(把某些请求踢出去回到 waiting，把它们的 KV 让出来)；构造 decode 用的 forward_batch 元信息。详见 [`Scheduler.update_running_batch()` 解析](scheduler-update-running-batch.zh.md)。
 
 **优先级**: prefill > decode。这是为了让新请求尽快首 token 化(降低 TTFT)，代价是已运行请求的 ITL 偶尔会被 prefill 拖慢——这就是 chunked prefill 的动机。
 
 ---
 
 ## 六 ④ 跑 forward：`run_batch()`
+
+> 详细分析见 [`Scheduler.run_batch()` 解析](scheduler-run-batch.zh.md)。
 
 源码：`scheduler.py:2767-2923`。核心是：
 
@@ -266,6 +280,8 @@ batch.output_ids = future_indices_or_next_token_ids
 
 ### 6.2 `process_batch_result()`
 
+> 详细分析见 [`Scheduler.process_batch_result()` 解析](scheduler-process-batch-result.zh.md)。
+
 `scheduler.py:2950` 起。按 `forward_mode` 分派到 `process_batch_result_decode / _prefill / _disagg_prefill / _prebuilt / _idle`。每条路径里都会：
 
 1. 把新 token append 到对应 `req.output_ids`。
@@ -276,6 +292,8 @@ batch.output_ids = future_indices_or_next_token_ids
 ---
 
 ## 七 推回 DetokenizerManager：`stream_output_generation()`
+
+> 详细分析见 [`Scheduler.stream_output()` / `stream_output_generation()` 解析](scheduler-stream-output.zh.md)。
 
 `scheduler_output_processor_mixin.py:910-1217`。每个请求把 `output_ids[read_offset:]`(自上次发送以来新增的部分) 收集到几个并列 list 里，按 batch 组装成 `BatchTokenIDOutput`：
 
