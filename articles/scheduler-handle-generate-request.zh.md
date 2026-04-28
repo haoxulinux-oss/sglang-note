@@ -137,6 +137,26 @@ elif session_id in self.session_controller and not ...close_on_finish:
 
 `session.create_req` 内部把上一轮保留的 prefix 拼到这一轮的 `origin_input_ids` 前面——这样 RadixCache 自动命中之前的 KV，多轮对话不需要重复 prefill。如果 session 状态已经异常(比如之前请求被 abort)，`finished_reason` 会被设置成 `FINISH_ABORT`，这里只是把它入队让 stream_output 把 abort 信息推回。
 
+#### 2.2.1 多轮对话:client 维护 vs server session(两条独立路径)
+
+之前一篇文章提到「调 `/generate` 时多轮对话和 chat template 都是 client 责任」,而这里又出现了 `session.create_req` 自动拼 prefix——看起来矛盾,**实际上 SGLang 提供两条互斥的可选路径**,client 选哪一条决定走哪个分支。
+
+| 维度 | client 维护(默认) | server session |
+|---|---|---|
+| 触发条件 | `/generate` 不带 `session_params`、`/v1/chat/completions` | client 主动调 `/open_session` 拿 session_id,后续请求带 `session_params={"id": ...}` |
+| Server 状态 | 无 | 有(`SessionController` 持有 prompt history) |
+| Client 每轮发什么 | 整段 history(渲染好的 prompt) | 只发当轮新输入 |
+| KV 重用机制 | RadixCache 基于 prefix 自动命中 | session prefix 直接拼接 + RadixCache 锦上添花 |
+| 网络开销 | 高(每轮发越来越长的 prompt) | 低(只发新 token) |
+| Client 复杂度 | 自己拼 history + 渲染模板 | 只管 session_id |
+| Server 复杂度 | 简单(无状态) | 复杂(要管 session 生命周期、过期回收) |
+| 主流用法 | **OpenAI 兼容、绝大多数生产场景** | 高频长对话、HTTP 带宽敏感场景 |
+| Multi-server 兼容 | 完美兼容(任意 server 都能接) | 需要 sticky routing(同 session 必须落到同一 server) |
+
+两条路径在源码里就是 `if session_id is None: ... elif session_id in self.session_controller: ...` 的互斥分支——**不会同时发生**。所以「client 维护」是默认场景下的描述,「session.create_req 拼 prefix」是显式开 session 时的可选优化,两者并不矛盾。
+
+补充:即使是「client 维护」路径,server 端也不会重复 prefill 上一轮内容——因为下一轮 prompt 的前缀和上一轮完全相同,**RadixCache 会自动命中**,只 prefill 新增的 user message + assistant 开口。所以默认路径并不浪费计算,只是浪费一点 HTTP 带宽。
+
 ### 2.3 会话不存在或正在关闭
 
 ```python
@@ -268,6 +288,57 @@ if req.logprob_start_len > len(req.origin_input_ids):
 ```
 
 `logprob_start_len` 控制从 prompt 哪个位置开始返回每个 token 的 logprob。`-1` 表示「只算 output 的」。这段把用户的输入归一化成 0..len(prompt) 范围内的合法值。
+
+### 6.1 背景:LLM 推理可以返回 logprob
+
+`logprob`(log-probability) 是模型采样某个 token 时,该 token 在词表上的对数概率。常见用途:
+
+- **评估**:eval 工具用 logprob 算 perplexity / NLL。
+- **debug**:看模型为什么选了这个词。
+- **重排**:beam search、speculative decoding 校验、best-of-N 重排。
+- **classification trick**:用 LLM 做分类时,看候选标签的 logprob 哪个最高。
+
+logprob 来自两个阶段:
+
+| 阶段 | logprob 含义 | 来自哪次 forward |
+|---|---|---|
+| **input(prompt) logprob** | prompt 里每个 token 在它前面 prefix 条件下的概率 | 一次 prefill forward 顺便算出来(logits 是现成的) |
+| **output(completion) logprob** | 生成的每个 new token 的采样概率 | 每个 decode step 算 |
+
+prompt 第一个 token 没法算 logprob(没有 prefix 条件),从第二个开始。
+
+### 6.2 `logprob_start_len` 控制从哪开始返回 input logprob
+
+它是 OpenAI/SGLang API 暴露的一个参数,**单位是 token 索引**——告诉 server「我只要 input 序列中从位置 X 开始的 logprob」。
+
+| 值 | 含义 |
+|---|---|
+| `-1`(默认) | **不返回 input logprob**,只返回 output logprob |
+| `0` | 从 prompt 第 1 个 token(没法算)/ 第 2 个开始全算 |
+| `len(prompt)` | 只算最后一个 prompt token 的 logprob(等价于「评估这段 prompt 的最后一步」) |
+| 任意 0 < N < len(prompt) | 从 prompt 第 N 个 token 开始算到结尾 |
+
+为什么需要起点参数:算 input logprob 不便宜——需要从 logits 里取出对应位置的 vocab 维度概率(vocab 几十万维),大批量请求下数据传输也是负担。让 client 指定起点,允许它「**只算我关心的尾段,跳过前面的 system prompt 之类**」。
+
+### 6.3 「校准」具体校的是什么
+
+「校准」就是把**用户原始传入的 `logprob_start_len`** 经过一套规则规范化成**实际可用的合法值**。三件事:
+
+1. **冗余清除**:用户没要 logprob 却给了 start_len → 强制改成 `-1`(防御性,避免参数自相矛盾)。
+2. **默认值填充**:用户要 logprob 但没指定 start_len(`-1`) → 自动选一个合理默认(只算 output 部分,因为这是 99% 的常见用法,不会浪费算力算 input logprob)。
+3. **越界保护**:start_len > prompt 长度 → 直接 abort 请求(不报错地传到下游会让 logprob 数组对不齐)。
+
+| 原始值(client 给的) | 校准后(`req.logprob_start_len`) | 行为 |
+|---|---|---|
+| `return_logprob=False, start_len=5` | `-1` | 不算 logprob(用户参数自相矛盾,server 修正) |
+| `return_logprob=True, start_len=-1` | `len(prompt)` | 只算 output logprob(默认行为) |
+| `return_logprob=True, start_len=10`(prompt 100 token) | `10` | 从位置 10 开始算到结尾 |
+| `return_logprob=True, start_len=200`(prompt 100 token) | abort | 越界 |
+| `is_prefill_only=True, start_len=-1` | `len(prompt)` | 跳过 input 也跳过 output(没 output) |
+
+> **「校准」 = 把 client 给的 `logprob_start_len` 与 `return_logprob` 等其他参数交叉验证,填充默认值,处理边界情况,产出 scheduler 内部 `req` 真正使用的合法 start_len**——后续 `process_batch_result_prefill` / `stream_output` 都按这个校准后的值来算和发 logprob。
+
+简而言之:**输入参数规范化**,让下游不用考虑各种异常组合。
 
 ---
 

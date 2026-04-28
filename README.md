@@ -20,6 +20,12 @@ SGLang 源码阅读笔记。English version: [README.en.md](README.en.md)。
 
 ### Scheduler
 
+#### Rank
+
+- [Scheduler / Worker 进程拓扑与各种 rank](articles/scheduler-rank-and-process-topology.zh.md)
+
+#### 主循环
+
 - [Scheduler 如何从 ZMQ 拿请求并跑推理](articles/scheduler-recv-and-run.zh.md)
   - [`recv_requests()` 解析](articles/scheduler-recv-requests.zh.md)
   - [`process_input_requests()` 解析](articles/scheduler-process-input-requests.zh.md)
