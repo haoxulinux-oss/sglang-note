@@ -4,6 +4,14 @@ SGLang 源码阅读笔记。English version: [README.en.md](README.en.md)。
 
 ## 文章目录
 
+### 基础知识
+
+- [Prefill 和 Decode](articles/basics-prefill-decode.zh.md)
+- [`forward` 在 LLM 领域的含义](articles/basics-forward.zh.md)
+- [`forward_mode` 是什么](articles/basics-forward-mode.zh.md)
+- [CUDA Graph 是什么](articles/basics-cuda-graph.zh.md)
+- [CUDA 是什么](articles/basics-cuda.zh.md)
+
 ### TokenizerManager
 
 - [`handle_loop()` 每行代码分析](articles/handle_loop-line-by-line.zh.md)
