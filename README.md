@@ -18,6 +18,10 @@ SGLang 源码阅读笔记。English version: [README.en.md](README.en.md)。
 - [`_handle_batch_output()` 解析](articles/handle_batch_output.zh.md)
 - [`_tokenize_one_request()` 与 `_tokenize_texts()` 解析](articles/tokenize-one-request.zh.md)
 
+### KV Cache
+
+- [KV cache 存什么、HBM 是什么、`_prefetch_kvcache()` 在做什么](articles/kvcache-prefetch-and-storage.zh.md)
+
 ### Scheduler
 
 #### Rank
