@@ -4,6 +4,10 @@
 
 **角色：** 主循环每轮的「调度器内核」——决定本轮 forward 跑什么。要么返回一个 prefill 批,要么返回一个 decode 批,要么返回 None(空闲)。
 
+> 想从概念层而非代码层理解这个函数(宏观职责、`waiting_queue`/`last_batch`/`running_batch` 三者关系、chunked_req 完整生命周期),先读 [深度解读](scheduler-get-next-batch-to-run-deep-dive.zh.md)。
+>
+> `self.chunked_req` 与 `self.last_batch.chunked_req` 的区别(尤其 PP 下两者会分歧),见 [`self.chunked_req` vs `self.last_batch.chunked_req`](scheduler-chunked-req-vs-last-batch-chunked-req.zh.md)。
+
 ---
 
 ## 一 函数全貌

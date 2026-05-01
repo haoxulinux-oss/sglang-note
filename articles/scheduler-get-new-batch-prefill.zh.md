@@ -65,7 +65,7 @@ def _get_new_batch_prefill_raw(self, prefill_delayer_single_pass):
 ```
 
 - ① **grammar ready 入队**：从 grammar 编译队列里把已编译完的请求拿出来扔进 waiting_queue,本轮就有机会上车。
-- ② **HiCache 事件**：处理 KV 写回 host RAM / SSD 的回调,腾 evictable 出来。
+- ② **HiCache 事件**：处理 KV 写回 host RAM / SSD 的回调,腾 evictable 出来。具体做三件事:`writing_check()` 收割 GPU→host 的 write-through ack、`loading_check()` 收割 host/SSD→GPU 的加载完成事件、`drain_storage_control_queues()` 处理 prefetch_revoke / backup ack / host_mem_release 三个控制队列。这一步**正是对入队时 `_prefetch_kvcache` 异步发起的预取请求做事件收割**——预取在 backend 线程后台跑完后,通过这些队列通知主循环,`check_hicache_events` 把它们消化掉,使后面 `check_prefetch_progress(req.rid)` 能看到完成状态、`pop_prefetch_loaded_tokens` 能拿到命中长度。详见 [KV cache 存什么、HBM 是什么、`_prefetch_kvcache()` 在做什么](kvcache-prefetch-and-storage.zh.md)。
 - ③ **优先级抢占**：如果允许抢占,重置 `batch_is_full` 让 PrefillAdder 有机会用高优请求踢掉低优的。
 - ④ **真没东西可跑**:空。
 
