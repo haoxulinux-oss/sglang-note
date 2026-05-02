@@ -96,7 +96,7 @@ future_indices_or_next_token_ids = batch_result.next_token_ids
 self.update_cache_from_scheduler(batch, batch_result)
 ```
 
-- `model_worker.forward_batch_generation` 进入 `tp_worker → model_runner → model.forward → sampler`,拿到 `next_token_ids` 和 `logits_output`。
+- `model_worker.forward_batch_generation` 进入 `tp_worker → model_runner → model.forward → sampler`,拿到 `next_token_ids` 和 `logits_output`。**这是 worker 真正跑模型的入口,详见 [`forward_batch_generation()` 解析(初学者向)](forward-batch-generation.zh.md)**。
 - `update_cache_from_scheduler`:把刚生成的 token KV 写回 RadixCache(让后续相同 prefix 的请求能命中)。
 
 ### 3.3 Path A:overlap schedule(GPU 部署的默认路径,务必理解)

@@ -24,6 +24,7 @@ flowchart TD
     F --> H[update_running_batch<br/>清 finished + retract + prepare decode]:::sched
 
     A --> I[run_batch<br/>worker.forward_batch_generation]:::forward
+    I --> I2[forward_batch_generation<br/>ForwardBatch.init_new → model.forward → sample]:::forward
 
     A --> J[process_batch_result<br/>按 forward_mode 5 路分派]:::output
     J --> K[stream_output / stream_output_generation<br/>BatchTokenIDOutput 推给 detokenizer]:::output
@@ -45,6 +46,7 @@ flowchart TD
     click G "scheduler-get-new-batch-prefill.zh.md" "get_new_batch_prefill 解析"
     click H "scheduler-update-running-batch.zh.md" "update_running_batch 解析"
     click I "scheduler-run-batch.zh.md" "run_batch 解析"
+    click I2 "forward-batch-generation.zh.md" "forward_batch_generation 解析(初学者向)"
     click J "scheduler-process-batch-result.zh.md" "process_batch_result 解析"
     click K "scheduler-stream-output.zh.md" "stream_output / stream_output_generation 解析"
     click Z1 "scheduler-get-next-batch-to-run-deep-dive.zh.md" "深度解读"
