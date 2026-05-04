@@ -44,5 +44,7 @@ SGLang 源码阅读笔记。English version: [README.en.md](README.en.md)。
   - [`update_running_batch()` 解析](articles/scheduler-update-running-batch.zh.md)
   - [`run_batch()` 解析](articles/scheduler-run-batch.zh.md)
     - [`forward_batch_generation()` 解析(初学者向)](articles/forward-batch-generation.zh.md)
+      - [`ModelRunner` 是什么(成员介绍)](articles/model-runner-overview.zh.md)
+      - [`ModelRunner.forward()` 方法详解(初学者向)](articles/model-runner-forward.zh.md)
   - [`process_batch_result()` 解析](articles/scheduler-process-batch-result.zh.md)
   - [`stream_output()` / `stream_output_generation()` 解析](articles/scheduler-stream-output.zh.md)
