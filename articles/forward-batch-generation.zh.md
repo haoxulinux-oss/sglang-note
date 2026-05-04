@@ -155,6 +155,8 @@ logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
 
 这是函数里**唯一真正在 GPU 上算东西的一步**——上面 ①、下面 ③④ 加起来 CPU 时间通常 < 1 ms,这一步占绝对大头。
 
+> 📖 **想深入看 `model_runner` 这个对象本身**:[`ModelRunner` 是什么(成员介绍)](model-runner-overview.zh.md);**想详细读 `forward()` 方法的决策树**:[`ModelRunner.forward()` 方法详解](model-runner-forward.zh.md)。
+
 `model_runner.forward` 的内部:
 
 1. **决定走 CUDA Graph 还是 eager 模式**:

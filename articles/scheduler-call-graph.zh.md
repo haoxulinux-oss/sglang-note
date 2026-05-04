@@ -25,6 +25,8 @@ flowchart TD
 
     A --> I[run_batch<br/>worker.forward_batch_generation]:::forward
     I --> I2[forward_batch_generation<br/>ForwardBatch.init_new → model.forward → sample]:::forward
+    I2 --> I3[ModelRunner.forward<br/>graph.replay 或 forward_decode/extend/idle]:::forward
+    I3 -. 关联阅读 .-> Z3[ModelRunner 成员介绍]:::topic
 
     A --> J[process_batch_result<br/>按 forward_mode 5 路分派]:::output
     J --> K[stream_output / stream_output_generation<br/>BatchTokenIDOutput 推给 detokenizer]:::output
@@ -47,6 +49,8 @@ flowchart TD
     click H "scheduler-update-running-batch.zh.md" "update_running_batch 解析"
     click I "scheduler-run-batch.zh.md" "run_batch 解析"
     click I2 "forward-batch-generation.zh.md" "forward_batch_generation 解析(初学者向)"
+    click I3 "model-runner-forward.zh.md" "ModelRunner.forward 方法详解"
+    click Z3 "model-runner-overview.zh.md" "ModelRunner 成员介绍"
     click J "scheduler-process-batch-result.zh.md" "process_batch_result 解析"
     click K "scheduler-stream-output.zh.md" "stream_output / stream_output_generation 解析"
     click Z1 "scheduler-get-next-batch-to-run-deep-dive.zh.md" "深度解读"
