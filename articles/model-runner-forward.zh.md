@@ -259,6 +259,11 @@ def forward(self, input_ids, positions, forward_batch,
 
 ### 5.3 内层:`LlamaDecoderLayer.forward`(`llama.py:303`)
 
+> 📖 **本节是单层 decoder 的入口,详细分篇文章见**:
+> - [`LlamaDecoderLayer.forward()` 总览](llama-decoder-layer-overview.zh.md) — 推荐起点,含 7 篇系列阅读路线
+> - [RMSNorm + 残差透传](llama-rmsnorm-and-residual.zh.md) | [Self-Attention 总览](llama-self-attention-overview.zh.md) | [QKV+GQA](llama-qkv-projection-gqa.zh.md) | [RoPE](llama-rope.zh.md) | [Attention+KV cache](llama-attention-and-kvcache.zh.md) | [MLP+SwiGLU](llama-mlp-swiglu.zh.md)
+
+
 ```python
 def forward(self, positions, hidden_states, forward_batch, residual):
     # Self Attention

@@ -27,6 +27,13 @@ flowchart TD
     I --> I2[forward_batch_generation<br/>ForwardBatch.init_new → model.forward → sample]:::forward
     I2 --> I3[ModelRunner.forward<br/>graph.replay 或 forward_decode/extend/idle]:::forward
     I3 -. 关联阅读 .-> Z3[ModelRunner 成员介绍]:::topic
+    I3 --> L1[LlamaDecoderLayer.forward<br/>每层:RMSNorm + Self-Attn + RMSNorm + MLP]:::forward
+    L1 -. 子模块 .-> L2[RMSNorm + 残差透传]:::topic
+    L1 -. 子模块 .-> L3[Self-Attention 总览]:::topic
+    L3 -. 子步骤 .-> L4[QKV + GQA]:::topic
+    L3 -. 子步骤 .-> L5[RoPE 旋转位置编码]:::topic
+    L3 -. 子步骤 .-> L6[Attention + KV cache]:::topic
+    L1 -. 子模块 .-> L7[MLP / SwiGLU]:::topic
 
     A --> J[process_batch_result<br/>按 forward_mode 5 路分派]:::output
     J --> K[stream_output / stream_output_generation<br/>BatchTokenIDOutput 推给 detokenizer]:::output
@@ -51,6 +58,13 @@ flowchart TD
     click I2 "forward-batch-generation.zh.md" "forward_batch_generation 解析(初学者向)"
     click I3 "model-runner-forward.zh.md" "ModelRunner.forward 方法详解"
     click Z3 "model-runner-overview.zh.md" "ModelRunner 成员介绍"
+    click L1 "llama-decoder-layer-overview.zh.md" "LlamaDecoderLayer.forward 总览"
+    click L2 "llama-rmsnorm-and-residual.zh.md" "RMSNorm 与残差透传"
+    click L3 "llama-self-attention-overview.zh.md" "Self-Attention 总览"
+    click L4 "llama-qkv-projection-gqa.zh.md" "QKV Projection 与 GQA"
+    click L5 "llama-rope.zh.md" "RoPE 旋转位置编码"
+    click L6 "llama-attention-and-kvcache.zh.md" "Attention 与 KV cache"
+    click L7 "llama-mlp-swiglu.zh.md" "MLP / SwiGLU"
     click J "scheduler-process-batch-result.zh.md" "process_batch_result 解析"
     click K "scheduler-stream-output.zh.md" "stream_output / stream_output_generation 解析"
     click Z1 "scheduler-get-next-batch-to-run-deep-dive.zh.md" "深度解读"

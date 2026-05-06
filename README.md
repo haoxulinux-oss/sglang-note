@@ -46,5 +46,12 @@ SGLang 源码阅读笔记。English version: [README.en.md](README.en.md)。
     - [`forward_batch_generation()` 解析(初学者向)](articles/forward-batch-generation.zh.md)
       - [`ModelRunner` 是什么(成员介绍)](articles/model-runner-overview.zh.md)
       - [`ModelRunner.forward()` 方法详解(初学者向)](articles/model-runner-forward.zh.md)
+        - [`LlamaDecoderLayer.forward()` 总览](articles/llama-decoder-layer-overview.zh.md) ★ 推荐入口
+          - [RMSNorm 与残差透传](articles/llama-rmsnorm-and-residual.zh.md)
+          - [Self-Attention 总览](articles/llama-self-attention-overview.zh.md)
+            - [QKV Projection 与 GQA](articles/llama-qkv-projection-gqa.zh.md)
+            - [RoPE 旋转位置编码](articles/llama-rope.zh.md)
+            - [Attention 计算与 KV cache 写入](articles/llama-attention-and-kvcache.zh.md)
+          - [MLP / SwiGLU](articles/llama-mlp-swiglu.zh.md)
   - [`process_batch_result()` 解析](articles/scheduler-process-batch-result.zh.md)
   - [`stream_output()` / `stream_output_generation()` 解析](articles/scheduler-stream-output.zh.md)
