@@ -36,9 +36,12 @@ x̂      = x / RMS(x)                   # 归一化:把"长度"拉回 1 量级
 y      = γ * x̂                        # 再乘上每维独立的可学习权重 γ(d 维)
 ```
 
-代码(`layernorm.py:287` 的 `forward_native`,简化版):
+### 2.1 用 `forward_native` 讲数学(不是真正运行的版本)
+
+下面这段是 PyTorch 纯实现,**只用来讲清楚 RMSNorm 的数学等价表达式,生产环境实际不走这里**(下一节 2.2 解释)。
 
 ```python
+# layernorm.py:287,简化版
 def forward_native(self, x, residual=None, ...):
     x = x.to(torch.float32)                       # FP32 算更稳
     if residual is not None:
@@ -51,7 +54,53 @@ def forward_native(self, x, residual=None, ...):
     return x, residual
 ```
 
-GPU 路径(`forward_cuda`,`layernorm.py:180`)调的是 `sgl-kernel` 编译好的 fused kernel(`fused_add_rmsnorm` 或 `rmsnorm`),原理一样,只是写在 CUDA。
+### 2.2 实际调用的是 `forward_cuda`(平台分发机制)
+
+`RMSNorm` 继承自 `MultiPlatformOp`(`python/sglang/srt/layers/utils/multi_platform.py:26`),**构造时一次性根据平台选定具体实现**:
+
+```python
+# multi_platform.py
+class MultiPlatformOp(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._forward_method = self.dispatch_forward()      # ← 启动期一次性选定
+
+    def forward(self, *args, **kwargs):
+        return self._forward_method(*args, **kwargs)        # ← 运行期直接走选好的版本
+
+    def dispatch_forward(self):
+        if _is_cuda:   return self.forward_cuda             # ← NVIDIA GPU 默认走这里
+        elif _is_hip:  return self.forward_hip
+        elif _is_npu:  return self.forward_npu
+        elif _is_xpu:  return self.forward_xpu
+        ...
+        else:          return self.forward_native           # 兜底
+```
+
+所以 `LlamaDecoderLayer.forward` 里的 `self.input_layernorm(...)`,**在 NVIDIA GPU 上实际调用的是 `forward_cuda`**(`layernorm.py:180`):
+
+```python
+# layernorm.py:180,实际运行的版本
+def forward_cuda(self, x, residual=None, ...):
+    ...
+    if residual is not None:
+        # ★ 一个 CUDA kernel 内完成 (x + residual) + RMSNorm,原地写
+        fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+        return x, residual
+    out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+    return out
+```
+
+**实现差别**:
+
+| 路径 | 谁来跑 | 几个 kernel | 何时被选中 |
+|---|---|---|---|
+| `forward_cuda` | sgl-kernel 编译的 C++/CUDA(`fused_add_rmsnorm` / `rmsnorm`) | **1 个 fused kernel** | NVIDIA GPU(默认) |
+| `forward_hip` | 同 forward_cuda | 1 个 | AMD ROCm |
+| `forward_native` | PyTorch op 一步步算(几个 reduce + 几个 elementwise) | **多个 kernel,中间张量来回读写** | CPU 兜底;torch.compile 模式临时切到这条以便 compile 穿透优化 |
+| `forward_npu` / `forward_xpu` / ... | 各硬件对应实现 | 视实现 | 对应硬件 |
+
+> **数学等价,性能差距巨大**:`forward_cuda` 把 add+RMSNorm+乘 γ 全融合,只对 hidden 张量读一次、写一次;`forward_native` 走 PyTorch 时要分多次 launch、产生中间张量。生产推理一律走 `forward_cuda`。
 
 ---
 
