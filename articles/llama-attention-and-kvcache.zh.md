@@ -155,7 +155,107 @@ scheduler 端在组 batch 时已经决定好这些位置——具体是 `BaseTok
 
 ---
 
-## 七 一个完整 prefill batch 的数据流(以 FlashInfer 为例)
+## 七 GQA 下 attention kernel 怎么算(以「一个 TP rank 正好是一个 group」为例)
+
+回顾 [QKV + GQA](llama-qkv-projection-gqa.zh.md):「4 个 Q 头共享 1 个 KV 头」。具体到 attention kernel,Q @ Kᵀ 是怎么算的?以 Llama-3-8B、TP=8 为例(本卡正好是 1 个 group)。
+
+### 7.1 这张卡上的张量形状
+
+```
+全局:   32 Q 头, 8 KV 头, head_dim=128, GQA group_size=4
+本卡:   4 Q 头, 1 KV 头, 1 V 头              ← 正好一个 group
+```
+
+经过 `qkv_proj` + split + RoPE + reshape 后:
+
+```
+Q ∈ [N=128, num_q_heads_local=4, head_dim=128]    形状 [128, 4, 128]
+K ∈ [N=128, num_kv_heads_local=1, head_dim=128]   形状 [128, 1, 128]
+V ∈ [N=128, num_kv_heads_local=1, head_dim=128]   形状 [128, 1, 128]
+```
+
+### 7.2 数学:4 次独立 attention,共享同一份 K、V
+
+```
+对本卡 Q 头 i ∈ {0, 1, 2, 3}:
+    attn_logits[i]  = Q[:, i, :] @ K[:, 0, :].T  / √d_k     形状 [128, 128]
+    attn_logits[i] += causal_mask                            (上三角设 -inf)
+    weights[i]      = softmax(attn_logits[i], dim=-1)        形状 [128, 128]
+    out[:, i, :]    = weights[i] @ V[:, 0, :]                形状 [128, 128]
+```
+
+注意 `K[:, 0, :]` 和 `V[:, 0, :]` 在 i=0,1,2,3 这 4 次循环里**完全一样**——这就是「共享」的字面意思。最后:
+
+```
+out ∈ [N, 4, head_dim] = [128, 4, 128]
+       reshape →  [N, 4 × head_dim] = [128, 512]
+```
+
+### 7.3 实际实现:K、V **不会**真的被复制 4 份
+
+朴素写法是把 K 重复 4 次让 Q、K 头数对齐再跑标准 MHA:
+
+```python
+K_rep = K.repeat_interleave(group_size=4, dim=1)   # [128, 1, 128] → [128, 4, 128]
+V_rep = V.repeat_interleave(group_size=4, dim=1)
+out   = standard_mha(Q, K_rep, V_rep)
+```
+
+**这种做法显存带宽爆炸**——同一份 K 从 HBM 被读 4 次。LLM 推理是 memory-bound,这等于把 GQA 的好处全废了。
+
+**FlashInfer / FA2 / FA3 / Triton 的真做法**:在 attention kernel 内部"虚拟广播",**K、V 物理只读一次**,被 4 个 Q 头复用。伪代码:
+
+```python
+# 在 attention kernel 内部(CUDA,不是 Python)
+for token_a in range(N):                            # query token
+    for token_b in range(token_a + 1):              # 历史 key token(causal)
+        # ★ K、V 从 HBM 读一次,缓存到 shared memory / 寄存器
+        k_block = K[token_b, 0, :]                  # 一个 KV 头的 128 维向量
+        v_block = V[token_b, 0, :]
+
+        for q_head_local in range(group_size=4):    # ← 4 次复用同一个 k_block / v_block
+            q = Q[token_a, q_head_local, :]
+            logit = dot(q, k_block) / sqrt(d_k)
+            ...
+```
+
+**关键事实**:
+- K、V 从 HBM 读取 1 次,**每读 1 次被 4 个 Q 头复用**,显存带宽节省 4 倍
+- KV cache 物理上只存 `[N, 1, 128]` 一份,**不复制**
+- `group_size` 作为 kernel 启动参数传入,kernel 内部按 `q_head // group_size` 索引到 KV 头
+
+### 7.4 单 group 是 GQA 的最简形态
+
+`q_head // group_size = q_head_local // 4 = 0`(本卡 4 个 Q 头都属于同一个 group,共享同一个 KV 头)。所以 attention kernel 里:
+
+```
+所有本卡 Q 头都用 K[:, 0, :] / V[:, 0, :] —— 唯一的那个 KV 头
+```
+
+K、V 形状 `[N, 1, 128]` —— **token 维仍是 N**,head 维只有 1。Q 这边是 `[N, 4, 128]`。kernel 对 q_head 这个维度做"对所有 head 用同一个 K"的广播,本质上只是 4 倍 Q-head 维度的 batch 化。
+
+### 7.5 算完之后 out 怎么用
+
+```
+本卡 out ∈ [N, 4, 128]
+       → reshape → [N, 512]                   ← 4 × 128 = 512 = hidden_size / TP
+       → o_proj (RowParallelLinear)
+       → [N, 4096](本卡 partial sum)
+       → all-reduce(跨 8 张 TP 卡求和)
+       → [N, 4096](完整 hidden_states,所有卡一致)
+```
+
+`o_proj` 输入 512 = `(本卡 Q 头数) × head_dim` = `4 × 128`,**恰好是本卡 4 个 Q 头的拼接**。`RowParallelLinear` 把 512 当作"hidden 维度被切了 8 份的其中一份",GEMM 后做 all-reduce 把 8 张卡各自的 partial sum 加起来 = 全部 32 个 Q 头共同贡献的完整 attention 输出。
+
+> 这一步呼应 [Self-Attention 总览](llama-self-attention-overview.zh.md) §四 `o_proj`:**TP 切的是 attention 头,不是 hidden_size 本身**;每张卡负责自己头的 attention,合并阶段在 `o_proj` all-reduce。
+
+### 7.6 一句话总结(本节)
+
+> 本卡 `Q ∈ [N, 4, 128]`,`K, V ∈ [N, 1, 128]`。**4 个 Q 头各自和这唯一的 K 头算 `Q_i @ K_0ᵀ / √d`,得 4 张 [N, N] logits;softmax 后再各自和这唯一的 V 头算加权和,得 [N, 4, 128] out**。物理上 K、V 只读 1 次,kernel 在 Q 头维做广播复用——这就是 GQA 在 prefill / decode kernel 里的真实运行方式。
+
+---
+
+## 八 一个完整 prefill batch 的数据流(以 FlashInfer 为例)
 
 ```
 Q ∈ [128, 4096]     ← LlamaAttention 给出的 q (32 heads × 128 dim,reshape 后 [128, 32, 128])
@@ -181,6 +281,6 @@ output ∈ [128, 4096]          ← 回到 hidden 维度
 
 ---
 
-## 八 一句话总结
+## 九 一句话总结
 
-> **`RadixAttention.forward` 是个分发壳**,把 q/k/v 派发到 `forward_batch.attn_backend`(FlashInfer / FA3 / Triton)。后端按 `forward_mode` 分 prefill / decode 两条路径,**先把当前 token 的 K、V 写到 `token_to_kv_pool`,再调 paged attention kernel 跑 softmax(Q·Kᵀ/√d)·V**。写和读用同一份 KV pool,这就是 SGLang 推理性能的核心所在。
+> **`RadixAttention.forward` 是个分发壳**,把 q/k/v 派发到 `forward_batch.attn_backend`(FlashInfer / FA3 / Triton)。后端按 `forward_mode` 分 prefill / decode 两条路径,**先把当前 token 的 K、V 写到 `token_to_kv_pool`,再调 paged attention kernel 跑 softmax(Q·Kᵀ/√d)·V**。写和读用同一份 KV pool;**GQA 下 K、V 在 kernel 内广播复用**,4 个 Q 头共享一份 K、V 而无需物理重复——这就是 SGLang 推理性能的核心所在。
