@@ -89,35 +89,187 @@ def _compute_cos_sin_cache(self):
 
 ### 3.2 运行期:`forward_native`(`base.py:205`)
 
+下面把这个函数**逐块**拆开,每一步说清楚"做了什么、为什么、形状变化、得到的张量长什么样"。先以具体例子打底:
+
+> **运行例**:Llama-3-8B、prefill 一段 128 个 token、本卡 32 个 Q 头(没开 TP)、`head_dim=128`、`rotary_dim=128`(整个 head 都参与 RoPE)。
+
+输入张量形状:
+- `positions`: `[128]` —— 每个 token 的位置编号 [0, 1, 2, ..., 127]
+- `query`: `[128, 32 × 128] = [128, 4096]` —— 32 个 Q 头拼起来
+- `key`: `[128, 8 × 128] = [128, 1024]` —— GQA 8 个 KV 头(为简化先假设 32 同 Q,后面再讨论 GQA)
+
+#### ① positions 预处理
+
 ```python
-def forward_native(self, positions, query, key, offsets=None, ...):
-    if offsets is not None:
-        positions = positions + offsets
-
-    positions = positions.flatten()
-    num_tokens = positions.shape[0]
-
-    cos_sin = self.cos_sin_cache.index_select(0, positions)  # [N, rotary_dim] ← 按位置查表
-    cos, sin = cos_sin.chunk(2, dim=-1)                      # 各 [N, rotary_dim/2]
-
-    # ★ 对 q 做旋转
-    query = query.view(num_tokens, -1, self.head_size)        # [N, num_heads, head_dim]
-    query_rot  = query[..., : self.rotary_dim]                # 前 rotary_dim 维要旋转
-    query_pass = query[..., self.rotary_dim :]                # 后面剩余维度直接 pass
-    query_rot  = self._apply_rotary_emb_wrapped(query_rot, cos, sin, self.is_neox_style)
-    query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
-    # ★ 对 k 做同样的旋转
-    ... (代码结构和 q 完全一致)
-    return query, key
+if offsets is not None:
+    positions = positions + offsets        # 极少用到。多模态 / RAG 场景里某些 token 要"假装"自己在另一个位置,通过 offset 平移
+positions = positions.flatten()            # 展平。如果 positions 是 [batch, seq] 二维,变成 [batch×seq] 一维
+num_tokens = positions.shape[0]            # N = 总 token 数,这里 N=128
 ```
 
-**关键点 4 个**:
+到此 `positions` 是 1D 张量,形状 `[N]`,值是每个 token 的绝对位置编号。
 
-1. **`cos_sin_cache.index_select(0, positions)`**:按每个 token 的 `position` 查出对应的 cos / sin 向量。这就是"根据位置 `m` 算 `cos(mθ)`、`sin(mθ)`"的查表实现。
-2. **`query[..., : self.rotary_dim]`**:有些模型只对前 `rotary_dim` 维做 RoPE(`partial_rotary_factor < 1`),后面维度保持原样。Llama 系是 100%。
-3. **`_apply_rotary_emb_wrapped`**:执行 `[x_2i; x_{2i+1}] → [x_2i·cos - x_{2i+1}·sin; x_2i·sin + x_{2i+1}·cos]`,在前一半 / 后一半还是奇偶维度配对(`is_neox_style`)上有区别——Llama 用 NeoX 风格(前一半/后一半配对)。
-4. **`v` 不参与 RoPE**——这是核心设计:位置信息只影响"相似度计算"(`Q·Kᵀ`),不影响"内容"(`V`)。
+#### ② 按位置查 cos/sin 表
+
+```python
+cos_sin = self.cos_sin_cache.index_select(0, positions)
+# self.cos_sin_cache 是启动期预算的 [max_pos=8192, rotary_dim=128] 张量
+# index_select(dim=0, indices=positions) 按每个 token 的 position 在第 0 维抽对应的行
+# 结果:cos_sin.shape = [128, 128]
+# cos_sin[i] = cos_sin_cache[positions[i]] —— 第 i 个 token 拿到属于它位置的那一行
+```
+
+回想 §3.1 给出的预计算:`cos_sin_cache[m]` 的前 64 维是 `cos(m·θ_0..63)`,后 64 维是 `sin(m·θ_0..63)`。所以现在 `cos_sin[i]` 就是「第 i 个 token 对应位置 m 的 cos 和 sin 数值集合」。
+
+**举例**:如果第 5 个 token 的 position=5,它就拿到 `cos_sin_cache[5]`,里面装着 `cos(5·θ_0), cos(5·θ_1), ..., cos(5·θ_63), sin(5·θ_0), ..., sin(5·θ_63)`。
+
+#### ③ 拆成 cos 和 sin
+
+```python
+cos, sin = cos_sin.chunk(2, dim=-1)
+# chunk(2, dim=-1) 沿最后一维平均切两半
+# cos.shape = [128, 64]   ← 前一半 (rotary_dim/2 维)
+# sin.shape = [128, 64]   ← 后一半 (rotary_dim/2 维)
+```
+
+`cos[i] = [cos(m·θ_0), cos(m·θ_1), ..., cos(m·θ_63)]`,`sin[i]` 同理。**每个 token 现在有 64 对 (cos, sin) 角度**,等会儿用来旋转 q 的 64 个维度对。
+
+#### ④ 把 query 整成 [N, num_heads, head_dim] 形状
+
+```python
+query_shape = query.shape                           # 记下原始形状 [128, 4096],等会儿恢复用
+query = query.view(num_tokens, -1, self.head_size)
+# view 不复制,只改 stride/shape
+# [128, 4096] → [128, 32, 128]
+#               ↑    ↑    ↑
+#              N 个  32   128
+#             token  头   每个头的维度
+```
+
+为什么要 reshape?**因为 RoPE 是按"每个头"独立做旋转的**——每个头的 128 维向量内部进行旋转,头之间互相不影响。
+
+#### ⑤ 切出 rotary 部分和 pass-through 部分
+
+```python
+query_rot  = query[..., : self.rotary_dim]          # 前 rotary_dim 维参与旋转
+query_pass = query[..., self.rotary_dim :]          # 后面剩余维度不旋转,直接透传
+```
+
+形状:
+- `self.rotary_dim` 一般等于 `head_dim`(Llama=128,**全部参与旋转**)
+- 但有些模型 `partial_rotary_factor < 1`,比如 Phi-3 是 0.4,这时只前 `0.4 × head_dim = 51` 维做 RoPE,后 77 维保持原样
+- Llama 默认 `partial_rotary_factor=1`,所以 `query_rot.shape = [128, 32, 128]`,`query_pass.shape = [128, 32, 0]`(空)
+
+#### ⑥ 真正做旋转:`_apply_rotary_emb_wrapped`
+
+```python
+query_rot = self._apply_rotary_emb_wrapped(
+    query_rot, cos, sin, self.is_neox_style
+)
+```
+
+这个函数源码在 `rotary_embedding/utils.py:36`(`apply_rotary_emb`),核心 6 行:
+
+```python
+def apply_rotary_emb(x, cos, sin, is_neox_style):
+    cos = cos.unsqueeze(-2).to(x.dtype)            # [N, 64] → [N, 1, 64]   广播到 head 维
+    sin = sin.unsqueeze(-2).to(x.dtype)            # 同上
+
+    if is_neox_style:                              # Llama / NeoX 风格(前一半 / 后一半配对)
+        x1, x2 = torch.chunk(x, 2, dim=-1)         # x.shape=[N, 32, 128] → x1=x2=[N, 32, 64]
+                                                    # x1 是 x 的前 64 维,x2 是后 64 维
+    else:                                           # GPT-J 风格(奇偶维度配对)
+        x1 = x[..., ::2]                           # 偶数维度
+        x2 = x[..., 1::2]                          # 奇数维度
+
+    o1 = x1 * cos - x2 * sin                       # ★ 旋转矩阵第 1 行
+    o2 = x2 * cos + x1 * sin                       # ★ 旋转矩阵第 2 行
+
+    if is_neox_style:
+        return torch.cat((o1, o2), dim=-1)         # 前一半放 o1,后一半放 o2
+    else:
+        return torch.stack((o1, o2), dim=-1).flatten(-2)   # 偶数位放 o1,奇数位放 o2
+```
+
+**这两行就是 RoPE 的全部数学**:
+
+```
+o1 = x1 * cos - x2 * sin
+o2 = x2 * cos + x1 * sin
+```
+
+它对应的旋转矩阵公式(每个维度对 (x1[i], x2[i]) 看成复数 x1[i] + i·x2[i],乘以 e^(iθ)):
+
+```
+[o1[i]]     [cos(mθ_i)   -sin(mθ_i)] [x1[i]]
+[o2[i]]  =  [sin(mθ_i)    cos(mθ_i)] [x2[i]]
+```
+
+**Llama 用 NeoX style 配对**——前 64 维 `x1` 和后 64 维 `x2` 一一配对成 64 个复数对:`(x[0], x[64]), (x[1], x[65]), ..., (x[63], x[127])`。注意**不是 (x[0], x[1]) 这种相邻配对**——这是 NeoX vs GPT-J 的关键区别。
+
+> NeoX vs GPT-J 在数学上等价(都是同样的旋转),只是**内存布局不同**——直接影响 GPU 上 attention kernel 的访存模式。Llama 选 NeoX 是历史原因(从 GPT-NeoX 衍生而来)。
+
+旋转后 `query_rot.shape = [128, 32, 128]`,**形状不变,数值变了**。
+
+#### ⑦ 拼回完整 query 并恢复原形状
+
+```python
+query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+# (query_rot, query_pass) 在最后一维拼接 → [128, 32, 128]
+# .reshape([128, 4096])  ← 恢复原始 [N, hidden] 形状
+```
+
+现在 `query` 形状回到 `[128, 4096]`,但**前一半内容是被 RoPE 旋转过的版本**(对 Llama 来说是全部内容)。
+
+#### ⑧ 对 key 做完全相同的处理
+
+```python
+key_shape = key.shape                              # [128, 1024]
+key       = key.view(num_tokens, -1, self.head_size)  # [128, 8, 128] (GQA: 8 个 KV 头)
+key_rot   = key[..., : self.rotary_dim]            # [128, 8, 128]
+key_pass  = key[..., self.rotary_dim :]            # [128, 8, 0]
+key_rot   = self._apply_rotary_emb_wrapped(key_rot, cos, sin, self.is_neox_style)
+key       = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+```
+
+代码结构和 q 完全一致。**注意:key 用的是和 query 同一份 `cos`、`sin`**——cos/sin 跟"位置"绑,不跟"是 Q 还是 K"绑;同一个 token 位置的 q 和 k 旋转同样的角度。
+
+#### ⑨ 返回
+
+```python
+return query, key
+```
+
+`v` 全程**没有被传入这个函数,也没有被改动**——这是 RoPE 的核心设计原则:**位置信息只影响"相似度计算"(Q·Kᵀ),不影响"内容"(V)**。
+
+---
+
+#### 一张表把所有形状串起来(N=128, num_q=32, num_kv=8, head_dim=128)
+
+| 阶段 | 张量 | 形状 |
+|---|---|---|
+| 输入 | `query` | `[128, 4096]` |
+| 输入 | `key` | `[128, 1024]` |
+| 输入 | `positions` | `[128]` |
+| 查表后 | `cos_sin` | `[128, 128]` |
+| 拆分后 | `cos`, `sin` | `[128, 64]` 各一 |
+| reshape 后 | `query` | `[128, 32, 128]` |
+| reshape 后 | `key` | `[128, 8, 128]` |
+| 切 rotary 后 | `query_rot` | `[128, 32, 128]`(Llama 全部参与) |
+| 切 rotary 后 | `query_pass` | `[128, 32, 0]` |
+| `_apply_rotary_emb_wrapped` 中 `x1, x2` | `[128, 32, 64]` 各一 | (NeoX 配对) |
+| `_apply_rotary_emb_wrapped` 中 `o1, o2` | `[128, 32, 64]` 各一 | (旋转后) |
+| 拼回后 | `query` | `[128, 4096]`(形状恢复) |
+| 输出 | `query`, `key` | `[128, 4096]` 和 `[128, 1024]`(数值变,形状不变) |
+
+#### 几个关键点
+
+1. **`cos_sin_cache.index_select(0, positions)`**:按每个 token 的 `position` 查出对应的 cos / sin 行。**这就是"根据位置 m 算 cos(mθ)、sin(mθ)"的查表实现**——cos/sin 在启动期预算好,运行时只是查表。
+2. **`query[..., : self.rotary_dim]`**:有些模型只对前 `rotary_dim` 维做 RoPE(`partial_rotary_factor < 1`),后面维度保持原样。Llama 系全部参与,所以 `query_pass` 是空。
+3. **`_apply_rotary_emb_wrapped`** 内核就两行 `o1 = x1·cos - x2·sin; o2 = x2·cos + x1·sin`,等价于把每个维度对当作复数旋转 `mθ_i` 角度。
+4. **NeoX vs GPT-J** 区别只在配对方式(前后半 vs 奇偶位),数学等价,内存布局不同。Llama 用 NeoX。
+5. **q、k 用同一份 cos / sin**,因为 RoPE 跟"位置"绑,不跟"是 Q 还是 K"绑。
+6. **v 不进这个函数**——位置信息只影响 Q·Kᵀ 相似度,不影响 V 内容。
 
 ### 3.3 调用点(`llama.py:203`)
 
