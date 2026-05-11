@@ -52,6 +52,7 @@ SGLang 源码阅读笔记。English version: [README.en.md](README.en.md)。
             - [QKV Projection 与 GQA](articles/llama-qkv-projection-gqa.zh.md)
             - [RoPE 旋转位置编码](articles/llama-rope.zh.md)
             - [Attention 计算与 KV cache 写入](articles/llama-attention-and-kvcache.zh.md)
+              - [`FlashInferAttnBackend.forward_extend()` 详解](articles/flashinfer-forward-extend.zh.md)
           - [MLP / SwiGLU](articles/llama-mlp-swiglu.zh.md)
   - [`process_batch_result()` 解析](articles/scheduler-process-batch-result.zh.md)
   - [`stream_output()` / `stream_output_generation()` 解析](articles/scheduler-stream-output.zh.md)

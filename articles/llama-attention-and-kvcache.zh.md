@@ -246,6 +246,8 @@ forward_batch.attn_backend          # FlashInferAttnBackend 实例
 
 ## 四 prefill 路径详解(`forward_extend`)
 
+> 📖 **本节是概览,深入解析见:[`FlashInferAttnBackend.forward_extend()` 详解](flashinfer-forward-extend.zh.md)**——讲清 `set_kv_buffer` 的归属类(`MHATokenToKVPool`)、`use_ragged` 含义、`prefill_wrapper_paged.forward` 实现位置(外部 flashinfer 项目)、三条执行分支(paged-only / 纯 ragged / split-K merge)。
+
 prefill 时一次进来一段(几十~几千 token)。**FlashInfer 的 prefill 内部要做**:
 
 1. **写 KV cache**:遍历这一批每个 token,按 `forward_batch.out_cache_loc` 给的索引,把对应的 K、V 写到 `token_to_kv_pool` 里
