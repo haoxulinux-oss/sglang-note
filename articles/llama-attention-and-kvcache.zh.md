@@ -59,6 +59,103 @@ def forward(self, q, k, v, forward_batch, save_kv_cache=True, **kwargs):
 
 > "**Radix**Attention" 这个名字源于 SGLang 的 RadixCache(prefix tree KV 复用),不是另一种算法,是同一种 attention 但配合 prefix tree 做 KV 复用。
 
+### 2.1 `forward_batch` 是 **一批请求**,不是一个
+
+`RadixAttention.forward` 的 `forward_batch` 参数是 `ForwardBatch` 实例——**装着整个 batch(多个请求)concat 在一起的全部 token 的数据**,不是单个请求。
+
+关键字段(简化):
+
+| 字段 | 形状 | 含义 |
+|---|---|---|
+| `input_ids` | `[total_tokens]` | 把 batch 里所有 req 的 token 在第 0 维 concat |
+| `positions` | `[total_tokens]` | 每个 token 的位置 |
+| `seq_lens` | `[batch_size]` | 每个 req 的总长度 |
+| `req_pool_indices` | `[batch_size]` | 每个 req 在 KV 池里的 slot 编号 |
+| `out_cache_loc` | `[total_tokens]` | 这一批新 token 各自要写到 KV pool 的哪个位置 |
+| `forward_mode` | enum | EXTEND / DECODE / IDLE / ... |
+
+具体到 `RadixAttention.forward` 的 q、k、v 输入:
+
+```
+prefill 例:batch_size=3, 每个 req prompt 长度 [128, 200, 64]
+  total_tokens = 128 + 200 + 64 = 392
+  q.shape = [392, num_q_heads, head_dim]
+  k.shape = [392, num_kv_heads, head_dim]
+  v.shape = [392, num_kv_heads, head_dim]
+  out_cache_loc.shape = [392]    ← 392 个新 token 各自的物理 KV slot
+
+decode 例:batch_size=8(8 个 req 各产 1 个新 token)
+  total_tokens = 8
+  q.shape = [8, num_q_heads, head_dim]
+  k.shape = [8, num_kv_heads, head_dim]   ← 8 个新 token 的 K
+  v.shape = [8, num_kv_heads, head_dim]
+  out_cache_loc.shape = [8]
+```
+
+**所以「batch 维」全部被压扁到第 0 维**——attention kernel 内部要通过 `seq_lens` / `req_pool_indices` 知道哪些 token 属于哪个 req、它的历史 KV 在哪些 slot。这种"扁平 + 索引"的布局是 SGLang(以及 vLLM)区别于 HF Transformers 的核心设计:**不 padding,不浪费,跨 req 高效共享 attention kernel 调用**。
+
+### 2.2 `unified_attention_with_output` 分支什么情况下进入,和直接 `attn_backend.forward` 的区别
+
+代码里的 if-else:
+
+```python
+if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+    ...
+    unified_attention_with_output(q, k, v, output, save_kv_cache, self.layer_id, **kwargs)
+    return output
+else:
+    return forward_batch.attn_backend.forward(q, k, v, self, forward_batch, ...)
+```
+
+**两个条件必须同时满足才走 `unified_attention_with_output`**:
+
+1. `forward_batch.forward_mode.is_extend()` —— prefill / chunked prefill / extend 路径
+2. `get_forward_context() is not None` —— 有人事先调过 `set_forward_context()`
+
+第 2 个条件是**关键**——`set_forward_context` **只在一个地方调用**:`piecewise_cuda_graph_runner.py`(`compilation/piecewise_context_manager.py:101`)。
+
+#### 什么是 piecewise CUDA Graph?
+
+回顾 [`ModelRunner.forward` 详解](model-runner-forward.zh.md):
+- decode 阶段大部分 batch 走完整 CUDA Graph(`graph_runner.replay()`)——一次 launch 跑完整层
+- prefill 阶段因为序列长度变化大,**不能录整段 graph**。SGLang 引入「**分段 CUDA Graph**」:把 transformer 切成若干「能 graph」的段,attention 这种动态形状操作作为「split 点」断开,前后两段各自录 graph
+
+`@register_split_op()` 装饰器(在 `unified_attention_with_output` 上)就是告诉 piecewise runner:**"这个 op 是 split 点,在这里断开 graph"**。runner 在 graph 外面手动调用这个 op,graph 内部不录它。
+
+#### 两个分支的实质区别
+
+| 分支 | 何时触发 | 谁调用 | 内部做什么 |
+|---|---|---|---|
+| **`unified_attention_with_output`**(上分支) | prefill + piecewise graph 已启用 | piecewise graph runner 在 graph 外通过 split op 接入 | **① 用 `get_forward_context()` 拿 forward_batch、attention_layers**;② **按 `real_num_tokens` 裁掉 padding**(graph 总是按桶 padding 到固定 batch_size,但实际 token 数更少);③ **最终还是调 `forward_batch.attn_backend.forward(...)`**;④ 把结果 copy 进 graph 预分配的 `output` 张量 |
+| **`forward_batch.attn_backend.forward(...)`**(下分支) | decode、或 prefill + 未启用 piecewise graph | 直接被 `RadixAttention.forward` 调用 | 直接派发到 `forward_decode` / `forward_extend`(下一节解释) |
+
+**关键**:上分支只是**「外面套了一层 padding 处理 + 输出 copy 的壳」**,**真正算 attention 的还是 `forward_batch.attn_backend.forward`**。
+
+源码可以验证(`radix_attention.py:182`,在 `unified_attention_with_output` 内部):
+
+```python
+def unified_attention_with_output(query, key, value, output, save_kv_cache, layer_id, ...):
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layer = context.attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    # 裁掉 padding,只保留真实 token
+    query = query[:real_num_tokens]
+    key   = key[:real_num_tokens]
+    value = value[:real_num_tokens]
+    forward_batch.out_cache_loc = forward_batch.out_cache_loc[:real_num_tokens]
+    ...
+
+    # ★ 最终还是调同一个 attn_backend.forward
+    ret = forward_batch.attn_backend.forward(query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs)
+
+    # 把结果 copy 进 graph 预分配的 output 张量
+    output[:real_num_tokens].view(ret.shape).copy_(ret)
+```
+
+> **一句话**:`unified_attention_with_output` 是**专为 piecewise CUDA Graph 设计的 split-op 包装层**,做 padding 裁剪 + 上下文获取 + 结果回填,内部仍然调 `attn_backend.forward`。**如果你没开 piecewise graph(或不在 prefill 阶段),全部走下分支直调**。
+
 ---
 
 ## 三 attention backend 的派发逻辑
@@ -84,6 +181,66 @@ def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
 | **DECODE** | `forward_decode` | 每个 req 只输入 1 个 token,query 维度小,attention 体积大(读全部历史 K/V) |
 | **EXTEND**(prefill / chunked prefill / target verify 等) | `forward_extend` | 每个 req 输入多个 token,query 维度大,可以分块算 |
 | **IDLE** | 空跑 | DP attention 下凑 batch 用 |
+
+### 3.1 `forward_batch.attn_backend` 在 RTX 4070(Ada Lovelace, SM 8.9)上具体是哪个类
+
+`forward_batch.attn_backend` 不是固定的——它由 `ModelRunner.init_attention_backend`(`model_executor/model_runner.py:2086`)在启动期根据「**硬件 + 模型架构**」选定。选择逻辑在 `server_args.py:2379` 的 `_get_default_attn_backend`:
+
+```python
+def _get_default_attn_backend(self, use_mla_backend, model_config):
+    if not use_mla_backend:       # MHA 架构(Llama / Qwen / Mistral 等)
+        if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
+            return "fa3"          # Hopper (H100/H200)
+        elif is_sm100_supported() and ...:
+            return "trtllm_mha"   # Blackwell (B200)
+        elif is_hip():
+            return "aiter"        # AMD ROCm
+        elif is_mps():
+            return "torch_native" # macOS Metal
+        else:
+            if is_flashinfer_available() and not model_config.has_attention_sinks:
+                return "flashinfer"     # ★ RTX 4070 落到这里
+            return "triton"
+    else:
+        ... # MLA 架构(DeepSeek 系)走另一套
+```
+
+**RTX 4070 是 Ada Lovelace(SM 8.9)**:不是 Hopper、不是 Blackwell、不是 AMD、不是 Apple Silicon——**走最后一个 else 分支**。FlashInfer 官方 wheel 支持 Ada Lovelace,所以你的 4070 默认就是 **`FlashInferAttnBackend`**(`layers/attention/flashinfer_backend.py:114`)。
+
+启动日志会有这一行确认:
+
+```
+Attention backend not specified. Use flashinfer backend by default.
+```
+
+### 3.2 RTX 4070 上 `forward_batch.attn_backend.forward(...)` 的具体调用栈
+
+```
+forward_batch.attn_backend          # FlashInferAttnBackend 实例
+                                    # 继承自 AttentionBackend
+   ↓ .forward(...)                  # 基类方法 base_attn_backend.py:81
+                                    # 按 forward_mode 派发
+   ↓
+   ├─ forward_mode.is_decode()  → self.forward_decode(...)   # ★ flashinfer_backend.py:889
+   │                                                          # 内部:
+   │                                                          # ① token_to_kv_pool.set_kv_buffer(...) 写 K, V
+   │                                                          # ② decode_wrapper.forward(...)
+   │                                                          #    → 调 flashinfer.BatchDecodeWithPagedKVCacheWrapper
+   │                                                          #    → 底层 C++/CUDA paged decode kernel
+   │
+   ├─ forward_mode.is_extend()  → self.forward_extend(...)   # ★ flashinfer_backend.py:775
+   │                                                          # 内部:
+   │                                                          # ① token_to_kv_pool.set_kv_buffer(...) 写 K, V
+   │                                                          # ② prefill_wrapper_paged.forward(...)
+   │                                                          #    → 调 flashinfer.BatchPrefillWithPagedKVCacheWrapper
+   │                                                          #    → 底层 C++/CUDA paged prefill kernel
+   │
+   └─ forward_mode.is_idle()    → 返回空张量(凑 batch 用)
+```
+
+**最底层真正算 attention 的是** [FlashInfer 项目](https://github.com/flashinfer-ai/flashinfer) 编译好的 CUDA kernel——SGLang 通过 Python wrapper(`BatchPrefillWithPagedKVCacheWrapper` / `BatchDecodeWithPagedKVCacheWrapper`)调用,**不是 SGLang 自己写的 attention kernel**。
+
+> 想换后端可以 `python -m sglang.launch_server --attention-backend triton`(其他选项见 `ATTENTION_BACKENDS` 注册表)。Triton 后端是纯 Python+Triton 实现,代码可读但比 FlashInfer 慢 1.5-3 倍,适合 debug。
 
 ---
 
