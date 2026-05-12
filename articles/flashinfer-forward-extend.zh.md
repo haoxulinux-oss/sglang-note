@@ -606,7 +606,134 @@ if save_kv_cache:
 
 ---
 
-## 八 一次完整 forward_extend 的形状追踪(分支 B 为例)
+## 八 命中的前缀什么时候参与 attention(关键澄清)
+
+> 📖 **想深入「RadixCache 是怎么管理这些 prefix 的」**,见两篇配套文章:
+> - [RadixCache 数据结构详解](radix-cache-structure.zh.md) — 树形 / TreeNode / match_prefix / split / lock_ref
+> - [一个请求在 RadixCache 视角下的完整生命周期](request-lifecycle-radix-cache.zh.md) — T0~T7 全程跟踪 `req.prefix_indices` / `req.last_node` / `extend_prefix_lens` 的变化
+
+你的疑问很对:**`forward_extend` 的参数 `q, k, v` 只包含「本批新 token」,不含已命中的 prefix**。那 prefix 怎么参与 attention 的?**答案是 prefix 从来不会被复制进 k, v 张量,它一直待在 KV cache 池里**——attention kernel 通过两种方式之一让它"参与":
+
+### 8.1 关键事实:prefix 一直在 cache 池里,不需要被"加进 q/k/v"
+
+回顾 [`_prefetch_kvcache`](kvcache-prefetch-and-storage.zh.md) 文章——**当一个新请求命中 RadixCache 前缀时,scheduler 在请求入队阶段已经把 prefix 的物理 KV slot 关联到本请求**:
+
+1. **RadixCache 命中**:scheduler 发现新请求的 prompt 前 500 个 token 已经在 cache 里(可能是另一个请求留下的,可能是 HiCache 预取来的)
+2. **关联(不复制)**:scheduler 通过 `req_to_token_pool[req_idx]` 这张映射表,**把那 500 个物理 slot 的编号"挂到"本请求名下**——零拷贝,只是改了一张 int 表
+3. **后续算 attention 时**:本请求的 KV "历史"就是这 500 个 slot,**它们的 K、V 数据物理上一直在 `k_buffer[layer]` / `v_buffer[layer]` 里**
+
+所以 `forward_extend` 被调到时:
+- **`q, k, v` 这三个参数**:只装"本批新 token"(prompt 剩余的、需要新算的部分)
+- **prefix 的 K、V**:**不出现在参数里**,但在 `forward_batch.token_to_kv_pool` 那个共享对象里随时可读
+- **`forward_batch.extend_prefix_lens`**:告诉 wrapper "这个 req 在 cache 里有这么多 token 的历史"
+
+### 8.2 两种"让 prefix 参与"的方式
+
+#### 方式 ①:Paged 全包(分支 A,`use_ragged=False`)
+
+```python
+# 先写新 K/V 到 cache —— 此时 cache 里同时有 prefix + 本批新 K/V,完整连续
+forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v, ...)
+
+# attention 一次性从 cache 读「prefix + new」整段
+o = prefill_wrapper_paged.forward(
+    q,
+    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),   # 整个 KV pool
+    causal=True, ...
+)
+```
+
+**关键**:wrapper 的 plan 阶段(见 §6.2.1)用 `seq_lens = prefix_len + extend_len`(总历史长度)和 `paged_kv_indices = [prefix 的 page id... | new 的 page id...]` 配置好,kernel 自动按完整序列长度跑 attention。**对 kernel 来说,prefix 和 new 没有差别,都是"cache 里的 KV"**。
+
+#### 方式 ②:Ragged + Paged 分两路 + LSE 合并(分支 C,`use_ragged=True` 有 prefix)
+
+```python
+# ── 第一路:新 K/V(ragged 张量,直接消费 forward_extend 输入)──
+o1, s1 = prefill_wrapper_ragged.forward_return_lse(q, k, v, causal=True, ...)
+
+# ── 第二路:prefix K/V(在 paged cache 里,kernel 通过页表读)──
+o2, s2 = prefill_wrapper_paged.forward_return_lse(q, cache, causal=False, ...)
+
+# 用 log-sum-exp 数学合并两段结果
+o, _ = merge_state(o1, s1, o2, s2)
+```
+
+**关键**:**q 是同一个 q**(本批新 token 的 query)在两路都用到,只是分别对"新 K"和"prefix K"算 attention,LSE 合并保证数学等价于「把 prefix 和 new K 拼起来一次性算」。
+
+### 8.3 数学等价性证明(为什么 merge_state 合法)
+
+把 prefix 的 key 记作 `K_p`,新 token 的 key 记作 `K_n`,对应 value 同理。**朴素做法**:
+
+```
+o = softmax([q·K_p^T | q·K_n^T] / √d) · [V_p; V_n]
+```
+
+记 `s_p = q·K_p^T / √d`,`s_n = q·K_n^T / √d`(都是行向量)。softmax 等价于:
+
+```
+o = [exp(s_p) | exp(s_n)] / Z · [V_p; V_n]
+  = (exp(s_p)·V_p + exp(s_n)·V_n) / Z          其中 Z = sum(exp(s_p)) + sum(exp(s_n))
+```
+
+**分别算**:
+
+```
+o_p = softmax(s_p) · V_p = exp(s_p)·V_p / Z_p     LSE_p = log(Z_p) = log(sum exp(s_p))
+o_n = softmax(s_n) · V_n = exp(s_n)·V_n / Z_n     LSE_n = log(Z_n)
+```
+
+**merge_state 用 LSE 重新归一化**:
+
+```
+α = Z_p / (Z_p + Z_n) = exp(LSE_p) / (exp(LSE_p) + exp(LSE_n))
+
+o = α · o_p + (1-α) · o_n
+  = (Z_p · o_p + Z_n · o_n) / (Z_p + Z_n)
+  = (exp(s_p)·V_p + exp(s_n)·V_n) / Z          ★ 和朴素做法相等
+```
+
+**所以 LSE 合并是无损的**——不是近似,是严格数学等价。两路 attention 可以并行算(GPU 多 SM 上并行),最后只需要一次轻量的 elementwise 合并。
+
+### 8.4 为什么搞这么麻烦?分两路有什么好处
+
+为何不直接走分支 A "先写 cache 再 paged 全包"?**两个工程原因**:
+
+1. **延后写 cache,让 attention 的写依赖更少**:分支 A 必须先 `set_kv_buffer` 把新 K/V 写完才能跑 attention,**两个 GPU 操作有 RAW 依赖**;分支 C 把"算 attention"和"写 cache"解耦,**两者可以并行 / 重排**,GPU stream 利用率更高
+2. **新 K/V 的布局优势**:本批新 K/V 是 ragged 紧凑张量,**显存访问是连续的 + 不经过页表间接寻址**,kernel 跑得比"从 paged cache 读这部分"略快。把热数据(新 K/V)用最快的方式算掉,冷数据(prefix)走 paged 走个保险
+
+代价是要多写一段 LSE 合并逻辑——但 merge_state 本身就是个小 elementwise kernel,几 μs,**得不偿失就是值**。
+
+### 8.5 prefix 是什么时候被放进 cache 的(回到时间线)
+
+把整个生命周期串起来:
+
+```
+T1:  请求 R1 第一次到来(prompt = "AAA + BBB",长度 2000)
+       └─ forward_extend(q=2000个token, k, v) 走分支 B(extend_no_prefix=True)
+            └─ prefill_wrapper_ragged 算 attention
+            └─ set_kv_buffer 把全部 2000 个 K/V 写进 cache pool
+       └─ R1 释放后,RadixCache 把这 2000 个 slot 标记为"可共享"
+
+T2:  请求 R2 到来(prompt = "AAA + CCC",前 1500 个 token 和 R1 一致)
+       └─ scheduler 在 RadixCache 里搜:发现前 1500 个 token 已存在
+       └─ req_to_token_pool[R2.req_idx][0:1500] = R1 留下的那 1500 个物理 slot
+       └─ R2 真正需要新算的只有 "CCC" 这部分,假设 500 个 token
+       └─ forward_extend(q=500个token, k=500, v=500) 走分支 C 或 A
+            ├─ 分支 A:set_kv_buffer 写新 500 个 → paged.forward(q=500, full_cache_len=2000)
+            └─ 分支 C:ragged.forward(q=500, k_new=500, v_new=500)  ←─ 新 token 内部 attention
+                      paged.forward(q=500, prefix_cache_len=1500)   ←─ 对 prefix 的 attention
+                      merge_state                                    ←─ LSE 合并
+```
+
+**核心观察**:R2 阶段 `forward_extend` 收到的 `q, k, v` 只有 500 个 token,但实际 attention 计算覆盖了完整的 2000 个 token——**少出来的 1500 个 prefix token 由 cache 池提供**,根本不经过函数参数。
+
+### 8.6 一句话总结
+
+> **prefix 不会被"加进"q, k, v——它一直在 KV cache 池里**。`forward_extend` 参数只装本批新 K、V,**通过 `forward_batch.extend_prefix_lens` 告诉 wrapper「这个 req 在 cache 里还有这么多历史」**;wrapper 要么 ① 先写新 K/V 让 cache 完整,然后一次性 paged.forward 读 prefix+new,要么 ② 分两路对 new (ragged) 和 prefix (paged) 各跑一次,最后用 log-sum-exp 数学等价地合并——这就是命中前缀如何"参与"attention 的全部机制。
+
+---
+
+## 九 一次完整 forward_extend 的形状追踪(分支 B 为例)
 
 batch=2,prompt 长度 [128, 64],Llama-3-8B,TP=1:
 
@@ -640,7 +767,7 @@ use_ragged = True, extend_no_prefix = True  → 走分支 B
 
 ---
 
-## 九 一图串起所有对象关系
+## 十 一图串起所有对象关系
 
 ```
 forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
@@ -674,6 +801,6 @@ forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
 
 ---
 
-## 十 一句话总结
+## 十一 一句话总结
 
 > **`FlashInferAttnBackend.forward_extend` = 「拿 PrefillMetadata 里的 wrapper + 写 KV cache + 调 FlashInfer kernel 算 softmax(QKᵀ/√d)·V」**。`set_kv_buffer` 是 **`MHATokenToKVPool`**(继承自 `KVCache`)的方法,真正持有 GPU HBM 上的 K/V 张量;`use_ragged` 表示 **K/V 来源是「输入张量(ragged 布局)」还是「KV cache 页表(paged 布局)」**,有历史前缀时会同时跑两条然后用 LSE 合并;`prefill_wrapper_paged.forward` 的实现**不在 SGLang,在外部 `flashinfer` 项目**(github flashinfer-ai/flashinfer),底层是手写的 paged attention CUDA kernel。

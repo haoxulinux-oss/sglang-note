@@ -22,6 +22,11 @@ SGLang 源码阅读笔记。English version: [README.en.md](README.en.md)。
 
 - [KV cache 存什么、HBM 是什么、`_prefetch_kvcache()` 在做什么](articles/kvcache-prefetch-and-storage.zh.md)
 
+#### RadixCache 系列
+
+- [RadixCache 数据结构详解](articles/radix-cache-structure.zh.md) — TreeNode / match_prefix / split / lock_ref / evict
+- [一个请求在 RadixCache 视角下的完整生命周期](articles/request-lifecycle-radix-cache.zh.md) — T0~T7 全程跟踪 + 关键变量传递路径
+
 ### Scheduler
 
 #### Rank
