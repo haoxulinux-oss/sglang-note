@@ -110,6 +110,42 @@ v_buffer[layer_id]: 同上                       → 128 MB / 层
 
 **每张卡每层有 `(size + page_size)` 个 KV slot**,每个 slot 是 `[head_num, head_dim]` 的一片小张量。`size` 是 scheduler 分配给 KV pool 的物理 token 容量上限,启动时根据剩余显存决定。
 
+#### 4.1.1 为什么要 `+ page_size`?这多出来的是什么
+
+源码注释(`memory_pool.py:880`)给出答案:
+
+> The padded slot 0 is used for writing dummy outputs from padded tokens.
+
+也就是说,**`size` 是真实有效 slot 数,`+ page_size` 是为了多出一段"哑(dummy)区"专门接收 padding token 的写入**。这一段额外空间存在于每个 buffer 的尾部(实现上是把 buffer 拉长 `page_size` 个 slot,然后**约定 slot 0 / 哑区是 dummy slot**)。
+
+**为什么需要哑区?** 跟 CUDA Graph 强相关。
+
+回顾 [`ModelRunner.forward`](model-runner-forward.zh.md) 里讲的:
+- decode 阶段大多走 **CUDA Graph 重放**(`graph_runner.replay`)
+- CUDA Graph 是按"batch_size 桶"预录的——比如桶 = {1, 2, 4, 8, 16, 32, 64, ...}
+- 如果实际 batch 只有 5 个 req,会向上对齐到桶 8,**多出来的 3 个位置就是 padding**
+
+padding 出来的 3 个 token 也会走 attention kernel,kernel 计算后也会试图调 `set_kv_buffer` 写 K、V——**但这些 padding token 不属于任何真实请求**,数据是垃圾,**绝对不能污染真实 slot**。
+
+解决办法:把这些 padding token 的 `out_cache_loc[i]` **统一写成 0**(`cuda_graph_runner.py:278` 启动期 `out_cache_loc.zero_()`,再用 `[:raw_num_token]` 覆盖真实 token),让它们都写到 **slot 0(哑区入口)** —— K、V 仍然被写出去,但被写到一个永远不会被任何 query 读取的"垃圾桶"位置。
+
+`+ page_size` 的另外两层作用:
+
+- **页对齐**:paged KV cache 按 `page_size`(SGLang 默认 16)分页管理,buffer 末尾留出一页避免最后一页越界访问
+- **预取/写入的 over-read 安全垫**:CUDA kernel 可能一次读/写一整页,即便最后一个真实 token 落在某页的中间位置,后续位置被 over-read 也不会触发非法访存
+
+直观示意:
+
+```
+k_buffer[layer_id]:
+  [ slot 0 ][ slot 1 ][ slot 2 ] ... [ slot size-1 ][ slot size ][ ... ][ slot size+page_size-1 ]
+    ↑                                  ↑              ↑                              ↑
+    dummy 哑区入口                     有效 slot 末尾  哑区开始(padding token 写到这里)
+    所有 padding token 都写到这里      
+```
+
+举例 Llama-3-8B + `size=65536`,`page_size=16`:`k_buffer = [65552, 8, 128]`,**前 65536 个 slot 真实可用,后 16 个 slot 是哑区**。哑区只占整个 buffer 的 0.024%,代价可忽略,换来 CUDA Graph 录制时不用区分 padding/真实 token,kernel 代码大幅简化。
+
 ### 4.2 `set_kv_buffer` 的核心代码
 
 ```python
@@ -171,6 +207,100 @@ FlashInfer 提供两种 prefill wrapper,**对应两种 K/V 的"输入布局"**:
 **Ragged = "不规整地拼接"**——这一批每个 req 的 K、V 序列长度不一样(128、200、64),直接 concat 成 `[total_tokens, num_kv_heads, head_dim]` 的扁平张量,kernel 通过 `seq_lens_cumsum` 知道每个 req 的边界。
 
 > 名字来源:相对于 padded(规整 padding 到统一长度,浪费显存),"ragged" 表示**不 padding、不规整、变长**——和 NestedTensor 是类似概念。
+
+#### 5.1.1 Ragged 布局图示(本批 K、V 的输入张量)
+
+batch=3,prompt 长度分别为 4、3、5(共 12 个 token):
+
+```
+                ┌─────── req A: 4 token ────────┐ ┌─── req B: 3 ───┐ ┌──── req C: 5 token ──────┐
+k 张量(扁平):  K_A0  K_A1  K_A2  K_A3   K_B0  K_B1  K_B2   K_C0  K_C1  K_C2  K_C3  K_C4
+索引(token):   0     1     2     3      4     5     6      7     8     9     10    11
+                                                                                            ↑ total_tokens = 12
+
+形状:  k.shape = [12, num_kv_heads, head_dim]
+       v.shape = 同上
+
+伴随的边界数组(指引 kernel 拆分):
+    seq_lens          = [ 4, 3, 5 ]         每个 req 的长度
+    seq_lens_cumsum   = [ 0, 4, 7, 12 ]     每个 req 的起始 / 终止 offset
+                          ↑  ↑  ↑   ↑
+                          A  B  C   end
+```
+
+**特点**:
+- **物理上是一段连续内存**(单个张量)——这就是 ragged 的核心
+- **没有 padding**(不补到统一长度,直接挨着拼)
+- **kernel 通过 `seq_lens_cumsum` 知道边界**:第 i 个 req 的 K 是 `k[seq_lens_cumsum[i] : seq_lens_cumsum[i+1]]`
+- 这一批算完 attention 后**才**写进 KV cache 池(分支 B 的执行顺序)
+
+#### 5.1.2 Paged 布局图示(KV cache 池里的全局存储)
+
+KV cache 池一层的全貌(`MHATokenToKVPool.k_buffer[layer_id]`):
+
+```
+        page 0          page 1          page 2          page 3          page 4         ...
+     ┌──────────┬──────────────┬──────────────┬──────────────┬──────────────┬────
+slot │ 0 ...15  │ 16 ...    31 │ 32 ...    47 │ 48 ...    63 │ 64 ...    79 │ ...
+     └──────────┴──────────────┴──────────────┴──────────────┴──────────────┴────
+           ↑          ↑             ↑              ↑               ↑
+       page_size=16   每页存连续 16 个 token 的 K(或 V),按 [page_size, head_num, head_dim] 排布
+
+每个 req 的「页表」(`req_to_token_pool` 维护):
+    req A (48 token, 占 3 页):    page_indices = [3, 0, 7]   ← 3 个页号,不一定连续!
+    req B (32 token, 占 2 页):    page_indices = [5, 12]
+    req C (60 token, 占 4 页):    page_indices = [1, 9, 14, 2]
+
+如果 req 的最后一页没用满,记录 last_page_len。
+```
+
+**特点**:
+- **物理上离散**——一个 req 的 KV 可能散落在多个非连续 page 上(显存动态分配 → 必然有碎片)
+- **通过「页表」间接寻址**:`req_pool_indices` → 一组 page id → 在 `k_buffer` 里取 page
+- **page_size=16 是 SGLang 默认值**(`--page-size` 可调,16 是性能 / 碎片的甜点)
+- **支持 RadixCache 前缀共享**:多个 req 共享同一组前缀页,显存零拷贝复用
+
+#### 5.1.3 两种布局对比图
+
+```
+══════════════════════ Ragged(用于本批新增 K、V)══════════════════════
+
+       本批 12 个新 token 的 K(一段连续内存,不补 padding):
+       ┌─────────────────────────────────────────┐
+       │ K_A0 K_A1 K_A2 K_A3 K_B0 K_B1 K_B2 K_C0... │
+       └─────────────────────────────────────────┘
+              ↑
+   kernel 直接读这段连续内存,通过 cumsum 知道 req 边界
+   无寻址间接性,SM 加载 K 时连续访问 → 带宽利用率高
+
+
+══════════════════════ Paged(用于 KV cache 历史)══════════════════════
+
+       KV pool(分页存储,可能跨多个 req 共享):
+
+       page 0     page 1     page 2     page 3     page 4     page 5  ...
+       ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐  ┌──────┐
+       │16 个 │  │16 个 │  │16 个 │  │16 个 │  │16 个 │  │16 个 │
+       │ slot │  │ slot │  │ slot │  │ slot │  │ slot │  │ slot │
+       └──────┘  └──────┘  └──────┘  └──────┘  └──────┘  └──────┘
+          ↑         ↑                                      ↑
+       req B    req A                                    req A
+       (page 0) (page 1)                                 (page 5)
+
+       req A 的页表 = [1, 5, ...]      ← 非连续!
+       req B 的页表 = [0, ...]
+
+   kernel 读 K_A 时:先查页表 [1, 5, ...] → 再去 page 1 / page 5 取数据
+   多一次「页表→物理地址」间接寻址,但能灵活管理(碎片少 + 前缀共享)
+
+
+══════════════════════ 一句话区分 ══════════════════════
+
+   Ragged  =  「本批输入,一段连续张量,长度不一,无寻址」
+   Paged   =  「全局历史,分页存储,跨 req 共享,有页表」
+```
+
+> **关键观察**:这两种布局不是"你用哪个"的选择,而是**「本批增量 K/V」用 ragged,「历史前缀 K/V」用 paged**——同一次 attention 可能两者都用到(就是 §七 分支 C 的情况)。`use_ragged` 这个 flag 控制的只是「**有没有可能走 ragged 路径**」,实际是否真的用 ragged 还要看是否有历史前缀。
 
 ### 5.2 `use_ragged` 何时为 True
 
@@ -261,6 +391,92 @@ output = prefill_wrapper_paged.forward(
 ```
 
 **`plan` 把"形状/索引/分块策略"算好,存在 wrapper 内部**——这是 host 端的轻量准备(几百 μs)。**`forward` 才是真正调 CUDA kernel**——所有 32 层都共享同一个 plan,只在第一层 attention 之前 plan 一次。
+
+#### 6.2.1 plan 和 forward 到底如何配合(展开)
+
+两阶段的协作可以这样理解:**plan 是"对这一批请求做总体规划",forward 是"按规划逐层执行"**。
+
+#### 第一步:plan 阶段(每次 forward_batch 跑一次)
+
+plan 的输入是**和具体某一层无关、只和这一批请求结构有关**的信息——`qo_indptr`(每个 req 的 query 偏移)、`paged_kv_indices`(每个 req 的页号)、`num_kv_heads`、`head_dim`、`page_size` 等。这些信息**不管跑第几层 attention 都一样**(因为同一 batch 内,每层的 KV 都存在同一组页里、batch_size、seq_lens 都不变)。
+
+plan 内部做的事:
+
+1. **算 tile 切分策略**:这一批要分成多少个 thread block,每个 block 负责哪几个 (req, token, head)
+2. **算 scheduler 元数据**:CUDA kernel 启动时要读的"任务派发表",决定哪个 SM 处理哪段
+3. **(可能)autotune**:跑 micro-benchmark 选最快的 kernel 变体
+4. **分配 scratch 显存**:每个 thread block 在中间结果(部分 softmax 的 LSE)需要的临时空间
+5. **把这些元数据存到 wrapper 内部的 GPU buffer 里**(`wrapper._paged_kv_indptr_buf` 等)
+
+plan 的特点:
+- **CPU 端工作较重**(几百 μs)——要做调度、autotune
+- **GPU 端工作较轻**(一些小张量拷贝)
+- **每次 forward_batch 跑前调用一次**——`FlashInferAttnBackend.init_forward_metadata` 内部通过 `indices_updater_prefill.update(...)` → `wrapper.begin_forward()`(`plan` 的别名)间接触发
+
+#### 第二步:forward 阶段(每层调一次,共 32 次)
+
+forward 的输入是**和具体某一层强相关的**——这一层的 Q 张量、这一层的 KV 池(`token_to_kv_pool.get_kv_buffer(layer_id)`)、scale 等。**plan 里准备好的所有元数据 wrapper 都还记得**,不需要再传一遍。
+
+forward 内部做的事:
+1. 用 plan 里存好的 tile 切分启动 CUDA kernel
+2. kernel 从 wrapper 内部的 GPU buffer 读 `paged_kv_indices` 等元数据
+3. 按 plan 决定的分配,SM 们并行算 attention
+4. 把结果写到 output 张量
+
+forward 的特点:
+- **CPU 端工作极轻**(只是一次 kernel launch,几 μs)
+- **GPU 端工作就是真正算 attention 的全部计算**
+- **每层 attention 调一次**——32 层模型就调 32 次
+
+#### 为什么要拆成两步?——「一次规划、多次执行」的节省
+
+朴素写法是把所有参数都塞给 forward 调用,每层都重新算一遍调度。但是:
+
+```
+                    plan      forward
+                    ┌──┐      ┌──┐
+Llama-3-8B 32 层:    │CPU│ +   │GPU│ × 32 层
+                    └──┘      └──┘
+                    几百μs    每层几十 μs
+
+如果不拆开,每层都要重做 plan:
+                    ┌─────────────┐
+                    │CPU+GPU│ × 32 层
+                    └─────────────┘
+                    几百 μs × 32 ≈ 累计 10+ ms ← 浪费,因为 plan 信息没变
+```
+
+CUDA Graph 时这个收益更明显:**plan 在 graph 外做(host 端)、forward 在 graph 内录制(纯 device 端)**——graph 录制要求所有操作不依赖 CPU 决策,所以"决策"必须提前完成。
+
+#### 具体时序示意(一个完整 forward_batch 的 attention 部分)
+
+```
+forward_batch 开始
+   │
+   ├─ FlashInferAttnBackend.init_forward_metadata()    ← 决定 use_ragged 等参数
+   │      └─ indices_updater_prefill.update()
+   │             └─ wrapper.begin_forward(...)         ★ 这就是 plan,一次
+   │                  │
+   │                  └─ 把 tile 调度 / page 索引 / scratch 配置存进 wrapper 内部
+   │
+   ├─ Llama 层 0 跑 forward
+   │      └─ attention →  prefill_wrapper_paged.forward(q, kv_cache, ...)   ★ run #1
+   │                            ↑ 从 wrapper 内部读 plan 好的配置,只传 q 和 kv_cache
+   │
+   ├─ Llama 层 1 跑 forward
+   │      └─ attention →  prefill_wrapper_paged.forward(q, kv_cache, ...)   ★ run #2
+   │
+   ├─ ... 中间 28 层同样 ...
+   │
+   ├─ Llama 层 31 跑 forward
+   │      └─ attention →  prefill_wrapper_paged.forward(q, kv_cache, ...)   ★ run #32
+   │
+   └─ forward_batch 结束
+```
+
+#### 一句话总结 plan + forward
+
+> **`plan` 做「批级一次性 host 规划」**(算调度、autotune、固化元数据到 GPU buffer);**`forward` 做「层级 GPU 计算」**(只传 Q 和该层的 KV cache 视图,kernel 从 plan 好的元数据起跑)。**32 层共享同一个 plan,所以拆开来比每层重做规划省一个数量级的 CPU 开销**——这是高性能推理引擎(SGLang / vLLM / TensorRT-LLM)都遵循的"plan-then-run"模式。
 
 ### 6.3 forward 内部走到哪个 kernel
 
