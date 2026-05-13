@@ -68,26 +68,40 @@
          ↓
          Scheduler.get_new_batch_prefill()            ← scheduler.py:2419
               │
+              │  ★ T1 阶段:match_prefix(由调度策略触发)★
+              │
+              ├─ self.policy.calc_priority(self.waiting_queue, self.running_batch)
+              │       │                                       ← scheduler.py:2474
+              │       │  (实例:SchedulePolicy)
+              │       │
+              │       └─ SchedulePolicy.calc_priority()       ← schedule_policy.py:117
+              │              │  if isinstance(policy, CacheAwarePolicy):
+              │              ↓
+              │              SchedulePolicy._compute_prefix_matches(waiting_queue, policy)
+              │                     ← schedule_policy.py:185
+              │                     │  (对 waiting_queue 全员批量做 prefix 匹配)
+              │                     │
+              │                     └─ self.tree_cache.match_prefix(MatchPrefixParams(...))
+              │                            ← radix_cache.py:398
+              │                            └─ _match_prefix_helper()    ← radix_cache.py:693
+              │                                  (可能触发 _split_node()) ← radix_cache.py:719
+              │                            返回 (device_indices, last_node, host_hit_length)
+              │                     │
+              │                     └─ 写到 r.prefix_indices / r.last_node / r.host_hit_length
               ↓
-              ┌──────── PrefillAdder.add_req() 主流程 ────────┐
-              │                                                │
-              │  ★ T1 阶段:match_prefix ★                    │
-              │                                                │
-              │  PrefillAdder.compute_prefix_matches()         │  ← schedule_policy.py:185
-              │       │  (本批 waiting_queue 全员批量做)       │
-              │       └─ self.tree_cache.match_prefix(...)     │  ← radix_cache.py:398
-              │              └─ _match_prefix_helper()         │  ← radix_cache.py:693
-              │                   (可能触发 _split_node())     │  ← radix_cache.py:719
-              │              返回 (device_indices, last_node)  │
+              ┌──────── PrefillAdder.add_one_req() 主流程 ──────┐
               │                                                │
               │  ★ T2 阶段:admit + lock + alloc ★            │
               │                                                │
               │  PrefillAdder.add_one_req(req)                 │  ← schedule_policy.py:780+
               │       └─ with self._lock_node(req.last_node):  │  ← schedule_policy.py:664
-              │              └─ tree_cache.inc_lock_ref()      │  ← radix_cache.py:637
-              │                                                │
-              │            self.can_run_list.append(req)       │
-              │            self._req_inc_lock_ref(req)         │  ★ 这里 lock_ref + 1
+              │              │   inc_lock_ref(临时护栏,with 退出会 dec)
+              │              ↓
+              │              tree_cache.inc_lock_ref(node)     │  ← radix_cache.py:637
+              │              │
+              │              self.can_run_list.append(req)     │
+              │              self._req_inc_lock_ref(req)       │  ★ 长期锁(给请求持有)
+              │              │   (在 with 内升级成长期锁,详见 §五)
               └────────────────────────────────────────────────┘
               │
               ↓
@@ -302,7 +316,16 @@ RadixCache:
 
 ## 四 阶段 T1:scheduler 取出请求,做 `match_prefix`
 
-**入口**:`PrefillAdder.compute_prefix_matches()`(`schedule_policy.py:185`),scheduler 每轮主循环组 batch 之前会批量做。
+**入口**:`SchedulePolicy._compute_prefix_matches()`(`schedule_policy.py:185`,**带下划线的私有方法**)。`Scheduler.get_new_batch_prefill()` 在 `scheduler.py:2474` 调 `self.policy.calc_priority(self.waiting_queue, self.running_batch)`,后者再进 `_compute_prefix_matches` 给本批 `waiting_queue` 全员做 prefix 匹配。
+
+调用链:
+
+```
+Scheduler.get_new_batch_prefill()       ← scheduler.py:2419
+   └─ self.policy.calc_priority()       ← schedule_policy.py:117 (SchedulePolicy 实例)
+        └─ self._compute_prefix_matches(waiting_queue, policy)
+                                        ← schedule_policy.py:185
+```
 
 ```python
 for r in waiting_queue:
