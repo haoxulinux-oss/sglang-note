@@ -29,11 +29,232 @@
 
 **新请求 R 到来**,prompt = `[A,B,C,...,X1, Y1,Y2,...,Y100]`(共 1124 个 token,前 1024 个和 node_X 一样,后 100 个全新),`max_new_tokens=50`。
 
-下面我们逐阶段看 RadixCache 和关键变量怎么变。
+下面先看一张**总流程图**,建立整体框架感,再逐阶段展开。
 
 ---
 
-## 二 阶段 T0:请求进入 scheduler
+## 二 总函数调用流程图(先看这张图)
+
+下图把请求 R 从入队到结束的所有关键调用画成一张图。**每个 T0~T7 阶段在图上都有明确的位置**——后面 §三~§十 各小节就是把每个阶段在这张图上展开讲解。
+
+```
+═══════════════════════════════════════════════════════════════════════════════
+                          ★ T0 阶段:请求入队 ★
+═══════════════════════════════════════════════════════════════════════════════
+
+  TokenizerManager(另一进程)
+    │  zmq 发送 TokenizedGenerateReqInput
+    ↓
+  Scheduler.recv_requests()                           ← scheduler.py:event_loop 内
+    └─ Scheduler.process_input_requests()
+        └─ Scheduler.handle_generate_request()        ← scheduler.py
+              │
+              │  构造 Req 对象,初始化各字段(req_pool_idx=None 等)
+              ↓
+        Scheduler._add_request_to_queue(req)          ← scheduler.py
+              │
+              │  self.waiting_queue.append(req)        ★ T0 完成,req 等候在队列里
+              ↓
+        (返回主循环 event_loop_normal)
+
+═══════════════════════════════════════════════════════════════════════════════
+                ★ T1~T3 阶段:scheduler 主循环组 batch ★
+═══════════════════════════════════════════════════════════════════════════════
+
+  Scheduler.event_loop_normal()                       ← scheduler.py:1384
+    └─ Scheduler.get_next_batch_to_run()              ← scheduler.py:2302
+         │
+         │  分流到 prefill 或 decode
+         ↓
+         Scheduler.get_new_batch_prefill()            ← scheduler.py:2419
+              │
+              ↓
+              ┌──────── PrefillAdder.add_req() 主流程 ────────┐
+              │                                                │
+              │  ★ T1 阶段:match_prefix ★                    │
+              │                                                │
+              │  PrefillAdder.compute_prefix_matches()         │  ← schedule_policy.py:185
+              │       │  (本批 waiting_queue 全员批量做)       │
+              │       └─ self.tree_cache.match_prefix(...)     │  ← radix_cache.py:398
+              │              └─ _match_prefix_helper()         │  ← radix_cache.py:693
+              │                   (可能触发 _split_node())     │  ← radix_cache.py:719
+              │              返回 (device_indices, last_node)  │
+              │                                                │
+              │  ★ T2 阶段:admit + lock + alloc ★            │
+              │                                                │
+              │  PrefillAdder.add_one_req(req)                 │  ← schedule_policy.py:780+
+              │       └─ with self._lock_node(req.last_node):  │  ← schedule_policy.py:664
+              │              └─ tree_cache.inc_lock_ref()      │  ← radix_cache.py:637
+              │                                                │
+              │            self.can_run_list.append(req)       │
+              │            self._req_inc_lock_ref(req)         │  ★ 这里 lock_ref + 1
+              └────────────────────────────────────────────────┘
+              │
+              ↓
+              ReqToTokenPool.alloc(reqs)              ← memory_pool.py:156
+                  └─ 给 req 分配 req_pool_idx
+              ↓
+              ScheduleBatch.prepare_for_extend()      ← schedule_batch.py:1598
+                  │
+                  ├─ token_to_kv_pool_allocator.alloc(extend_num_tokens)
+                  │     ↑ 分配新物理 KV slot
+                  │
+                  └─ req_to_token_pool.write(...)
+                        ↑ 填好 req_to_token[req_pool_idx][0:1124] 映射
+              ↓
+              ★ T3 阶段:prepare ForwardBatch ★
+
+              ScheduleBatch.get_model_worker_batch()  ← schedule_batch.py:2431
+                  └─ ModelWorkerBatch
+                       ├─ extend_prefix_lens          ★ ★ 关键字段 ★ ★
+                       ├─ extend_seq_lens
+                       ├─ seq_lens
+                       ├─ out_cache_loc
+                       ├─ req_pool_indices
+                       └─ ...
+              ↓
+              返回新 batch 给主循环
+
+═══════════════════════════════════════════════════════════════════════════════
+                   ★ T4 阶段:worker / kernel 实际执行 ★
+═══════════════════════════════════════════════════════════════════════════════
+
+  Scheduler.run_batch(batch)                          ← scheduler.py:2767
+    └─ self.tp_worker.forward_batch_generation(model_worker_batch)
+                                                      ← tp_worker.py:443
+         │
+         ├─ ForwardBatch.init_new(...)               ← forward_batch_info.py
+         │     │  把 ModelWorkerBatch 转成 ForwardBatch
+         │     │  挂上 token_to_kv_pool / attn_backend
+         │     │  extend_prefix_lens 传进来
+         │     ↓
+         │
+         ├─ model_runner.forward(forward_batch)       ← model_runner.py:2896
+         │     │
+         │     └─ FlashInferAttnBackend.init_forward_metadata(forward_batch)
+         │     │       ← flashinfer_backend.py:433
+         │     │  (执行一次 plan,绑定 paged_kv_indices 等元数据)
+         │     │
+         │     ↓
+         │     for layer_id in range(num_layers):     ← 32 层循环
+         │         │
+         │         └─ LlamaForCausalLM.forward()      ← llama.py:510
+         │              └─ LlamaModel.forward()        ← llama.py:366
+         │                   └─ LlamaDecoderLayer.forward()  ← llama.py:303
+         │                        └─ LlamaAttention.forward() ← llama.py:220
+         │                             ├─ qkv_proj + split + RoPE
+         │                             └─ RadixAttention.forward(q, k, v, forward_batch)
+         │                                  ← radix_attention.py:99
+         │                                  │
+         │                                  └─ forward_batch.attn_backend.forward(...)
+         │                                      ↓
+         │                                      FlashInferAttnBackend.forward_extend(q, k, v, layer, ...)
+         │                                          ← flashinfer_backend.py:775
+         │                                          │
+         │                                          ├─ token_to_kv_pool.set_kv_buffer()
+         │                                          │     ← memory_pool.py:1022
+         │                                          │  写新 K, V 到 slot [2000..2099]
+         │                                          │
+         │                                          ├─ prefill_wrapper_ragged.forward(q, k_new, v_new)
+         │                                          │  → o1, s1   (对本批新 K/V 算 attention)
+         │                                          │
+         │                                          ├─ prefill_wrapper_paged.forward(q, full_cache)
+         │                                          │  → o2, s2   (对 prefix K/V 算 attention)
+         │                                          │
+         │                                          └─ merge_state(o1, s1, o2, s2)
+         │                                              → 最终 attention 输出
+         │
+         └─ model_runner.sample(logits)               ← model_runner.py:3070
+              (采样 next_token_ids 返回给 scheduler)
+
+═══════════════════════════════════════════════════════════════════════════════
+              ★ T5 阶段:prefill 完成,新 token 挂回 RadixCache ★
+═══════════════════════════════════════════════════════════════════════════════
+
+  Scheduler.process_batch_result(batch, result)       ← scheduler.py:2950
+    └─ Scheduler.process_batch_result_prefill()       ← scheduler_output_processor_mixin.py:126
+         │
+         │  if req 已完成 (EOS / max_new_tokens):
+         │      → 跳到 T7
+         │  else (req 还要继续 decode):
+         │      ↓
+         └─ tree_cache.cache_unfinished_req(req)      ← scheduler_output_processor_mixin.py:200
+                ↓
+                RadixCache.cache_unfinished_req(req)  ← radix_cache.py:535
+                     │
+                     ├─ token_ids = req.fill_ids       (本批所有 token,1124 个)
+                     ├─ kv_indices = req_to_token_pool.req_to_token[5][:1124]
+                     ↓
+                     ├─ self.insert(InsertParams(key, value))  ← radix_cache.py:468
+                     │     └─ _insert_helper()                  ← radix_cache.py:749
+                     │          创建新节点 node_Y(挂在 node_X 下)
+                     ↓
+                     ├─ token_to_kv_pool_allocator.free(重复 slot)
+                     ├─ self.match_prefix(...)         (重新匹配以拿新 indices)
+                     ├─ req_to_token_pool.write(...)   (更新映射)
+                     ↓
+                     ├─ self.dec_lock_ref(req.last_node)   ← 释放对旧 last_node 的锁
+                     └─ self.inc_lock_ref(new_last_node)   ← ★ last_node 切换到 node_Y
+
+═══════════════════════════════════════════════════════════════════════════════
+                ★ T6 阶段:decode 阶段循环 50 次 ★
+═══════════════════════════════════════════════════════════════════════════════
+
+  (回到主循环,req 进入 running_batch)
+  Scheduler.event_loop_normal()       ← 又一轮
+    └─ Scheduler.update_running_batch(batch)         ← scheduler.py:2669
+         └─ ScheduleBatch.prepare_for_decode()       ← schedule_batch.py:2179
+              └─ token_to_kv_pool_allocator.alloc(1)     ★ 每轮分配 1 个 slot
+              └─ req_to_token_pool.req_to_token[5][i] = new_slot
+
+    └─ Scheduler.run_batch(batch)                    ← forward_mode = DECODE
+         └─ ... (同 T4 但走 FlashInferAttnBackend.forward_decode)
+              ← flashinfer_backend.py:889
+
+    └─ Scheduler.process_batch_result_decode()       ← scheduler_output_processor_mixin.py:390
+         │  (decode 阶段不 cache_unfinished_req,树不动)
+         │  累积 output_ids
+         ↓
+  循环 50 次,直到 EOS 或达到 max_new_tokens
+
+═══════════════════════════════════════════════════════════════════════════════
+            ★ T7 阶段:请求结束,KV 完全归还 RadixCache ★
+═══════════════════════════════════════════════════════════════════════════════
+
+  Scheduler.process_batch_result_decode()
+    └─ (检测到 req.finished_reason)
+    └─ release_kv_cache(req, self.tree_cache)        ← mem_cache/common.py:479
+         │
+         ├─ tree_cache.cache_finished_req(req)       ← radix_cache.py:488
+         │     ↓
+         │     ├─ insert(全部 fill_ids + output_ids 进树)
+         │     │    创建 node_Z(挂在 node_Y 下)
+         │     │
+         │     ├─ token_to_kv_pool_allocator.free(重复 slot)
+         │     ├─ token_to_kv_pool_allocator.free(未对齐尾部)
+         │     │
+         │     └─ self.dec_lock_ref(req.last_node)
+         │          沿 node_Y → node_X → root 一路 dec_ref
+         │          ★ 所有节点 lock_ref 归零,可被淘汰
+         │
+         ├─ req_to_token_pool.free(req_pool_idx)     ← 归还 req 的 slot
+         │
+         └─ scheduler 把 req 从 running_batch 移出,把结果 stream 给 detokenizer
+```
+
+**几个关键观察**:
+
+1. **T1 / T2 紧挨着**——`match_prefix` 完后立刻进 admit + lock,中间不释放,**避免在临界区中被 evict**
+2. **T3 / T4 / T5 一气呵成**——一次 `run_batch` 调用内完成「prepare → forward → cache_unfinished_req」三件事
+3. **T4 才是真正接触 GPU 的地方**——前面 T0~T3 都是 CPU 端的元数据准备
+4. **T6 是循环**——每生成一个 token 都走一遍 prepare_for_decode → forward_decode,**RadixCache 树形完全不变**
+5. **T5 和 T7 都调 RadixCache.insert**——但 T5 是「中途同步」(请求还没结束),T7 是「最终归档」
+
+下面 §三~§十 把每个阶段在这张图上展开,讲清每个调用的输入输出和关键变量。
+
+---
+
+## 三 阶段 T0:请求进入 scheduler
 
 **入口**:`Scheduler.handle_generate_request()`(`scheduler.py`)
 
@@ -79,7 +300,7 @@ RadixCache:
 
 ---
 
-## 三 阶段 T1:scheduler 取出请求,做 `match_prefix`
+## 四 阶段 T1:scheduler 取出请求,做 `match_prefix`
 
 **入口**:`PrefillAdder.compute_prefix_matches()`(`schedule_policy.py:185`),scheduler 每轮主循环组 batch 之前会批量做。
 
@@ -133,7 +354,7 @@ RadixCache:
 
 ---
 
-## 四 阶段 T2:`PrefillAdder.add_one_req` admit + 锁住 node + 分配新 slot
+## 五 阶段 T2:`PrefillAdder.add_one_req` admit + 锁住 node + 分配新 slot
 
 **入口**:`PrefillAdder.add_one_req()`(`schedule_policy.py:780+`)
 
@@ -236,7 +457,7 @@ RadixCache:
 
 ---
 
-## 五 阶段 T3:`new_batch.prepare_for_extend` 拼 ForwardBatch
+## 六 阶段 T3:`new_batch.prepare_for_extend` 拼 ForwardBatch
 
 **入口**:`ScheduleBatch.prepare_for_extend()`(`schedule_batch.py:1577+`)
 
@@ -288,7 +509,7 @@ RadixCache 树形**不变**;`node_X.lock_ref` 仍然是 1。
 
 ---
 
-## 六 阶段 T4:worker / attention kernel 实际执行
+## 七 阶段 T4:worker / attention kernel 实际执行
 
 **入口**:`forward_batch_generation` → `model_runner.forward` → `LlamaDecoderLayer.forward` → `LlamaAttention.forward` → `RadixAttention.forward` → `FlashInferAttnBackend.forward_extend`(详见 [forward 详解](flashinfer-forward-extend.zh.md))。
 
@@ -362,7 +583,7 @@ RadixCache:
 
 ---
 
-## 七 阶段 T5:prefill 完成 → `cache_unfinished_req` 把新 token 挂到树里
+## 八 阶段 T5:prefill 完成 → `cache_unfinished_req` 把新 token 挂到树里
 
 **入口**:`Scheduler.process_batch_result_prefill()` → `scheduler_output_processor_mixin.py:200` 调 `tree_cache.cache_unfinished_req(req)`。
 
@@ -450,7 +671,7 @@ RadixCache:
 
 ---
 
-## 八 阶段 T6:decode 阶段 — 每步分配一个 slot 但 RadixCache 不变
+## 九 阶段 T6:decode 阶段 — 每步分配一个 slot 但 RadixCache 不变
 
 R 进入 decode 阶段,每轮生成 1 个 token,前后 50 个 token(`max_new_tokens=50`)。
 
@@ -487,7 +708,7 @@ RadixCache:
 
 ---
 
-## 九 阶段 T7:请求结束 → `cache_finished_req`
+## 十 阶段 T7:请求结束 → `cache_finished_req`
 
 **入口**:`Scheduler` 检测到 R 结束(EOS / 长度上限),调 `release_kv_cache`(`mem_cache/common.py:479`)→ `tree_cache.cache_finished_req(req)`。
 
@@ -578,7 +799,7 @@ RadixCache:
 
 ---
 
-## 十 全程时间线总览
+## 十一 全程时间线总览
 
 ```
 时间     │  RadixCache 树形                              │  关键变量
@@ -611,7 +832,7 @@ T7 finish │  root─node_X(lock=0)                          │  req 释放
 
 ---
 
-## 十一 关键变量的传递路径(回答用户原问题)
+## 十二 关键变量的传递路径(回答用户原问题)
 
 > **`forward_batch.extend_prefix_lens` 看起来是一个关键成员,它记录了一个 req 的前缀有多长**
 
@@ -648,6 +869,6 @@ prefill_wrapper.plan(...) / begin_forward(...)
 
 ---
 
-## 十二 一句话总结
+## 十三 一句话总结
 
 > **一个请求的完整生命周期是 7 个阶段**:T0 入队 → T1 `match_prefix` 拿到 `prefix_indices` 和 `last_node` → T2 `inc_lock_ref` 锁住前缀 + 分配 `req_pool_idx` + alloc 新 slot → T3 `prepare_for_extend` 算出 `extend_prefix_lens` 等张量 → T4 attention kernel 跑「split-K」并写新 K/V 到 cache 池 → T5 `cache_unfinished_req` 把新 token 挂回树(创建新节点,切换 `last_node`) → T6 decode 阶段每步 alloc 1 个新 slot 但**树不变** → T7 `cache_finished_req` 插入最终段并 `dec_lock_ref` 释放,**留下的 KV 全部成为可复用前缀**。`RadixCache` 的树形变化主要发生在 T2(分配)、T5(`cache_unfinished_req` 插入)、T7(`cache_finished_req` 插入)三个时刻,其他阶段只是 `lock_ref` 计数变化或物理 slot 池的 alloc/free。
