@@ -383,8 +383,9 @@ RadixCache:
 
 ```python
 # 计算 extend_input_len = 总长度 - 已命中前缀长度
-prefix_len = len(req.prefix_indices)       # 1024
-real_input_tokens = req.extend_input_len - req.host_hit_length  # 1124-1024 = 100
+real_input_tokens = req.extend_input_len - req.host_hit_length    # 见 §5.1
+real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+prefix_len = len(req.prefix_indices)        # 见 §5.1,这两个数不是一回事
 
 # 关键:进入临界区,锁住 node_X
 with self._lock_node(req.last_node):       # ★ inc_lock_ref(node_X)
@@ -396,10 +397,213 @@ with self._lock_node(req.last_node):       # ★ inc_lock_ref(node_X)
 
     # 给请求分配 req_pool_idx
     self.can_run_list.append(req)
-    self._req_inc_lock_ref(req)             # ★ 第二次 inc(为了请求长期持有)
+    self._req_inc_lock_ref(req)             # ★ 长期锁(详见 §5.2 双层锁机制)
 ```
 
-### `inc_lock_ref` 触发的链路(`radix_cache.py:637`):
+### 5.1 `len(req.prefix_indices)` 和 `req.host_hit_length` 是同一回事吗?
+
+**不是**。它们是「两种不同来源的前缀命中」,数值上**独立、叠加**。
+
+| 字段 | 在哪 | 表征 |
+|---|---|---|
+| **`req.prefix_indices`** | **device 命中**——KV 数据已经在 GPU HBM 里 | int64 张量,**`len(...)` = device 命中 token 数** |
+| **`req.host_hit_length`** | **host 命中**——KV 备份在 host RAM(HiCache 第 2 层),还没拉回 GPU | 整数,host 命中的额外 token 数 |
+
+`match_prefix` 同时返回两者(`schedule_policy.py:204`):
+
+```python
+(r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length) = (
+    match_result.device_indices,        # ← prefix_indices = device 命中索引
+    match_result.last_device_node,
+    match_result.last_host_node,
+    match_result.host_hit_length,       # ← host 命中长度(超出 device 部分)
+)
+```
+
+完整 prompt 的命中视图:
+
+```
+                                完整 prompt(1124 token)
+   ├────────────────────────────────────────────────────────────────┤
+
+   ├─ device 命中(1024) ─┤─ host 命中(50) ─┤─ 需要重新 prefill(50) ─┤
+   │   prefix_indices       │   host_hit_length│   real_input_tokens     │
+   │   GPU 上的 slot 索引   │   在 RAM 里,等会儿 │   完全新算              │
+   │                        │   init_load_back   │
+   │                        │   拉回 GPU         │
+```
+
+#### 那 4 行代码的含义对照(以 device=1024, host=50 为例)
+
+```python
+real_input_tokens = req.extend_input_len - req.host_hit_length    # 100 - 50 = 50
+                  = "extend 范围内,扣除 host 能补的,真正要 GPU 重算的 token 数"
+real_input_tokens = self.ceil_paged_tokens(real_input_tokens)     # page_align 到 64
+
+prefix_len = len(req.prefix_indices)                              # 1024
+           = "device 上已经占的 slot 数"
+           = 后面 _update_prefill_budget(prefix_len, ...) 和 req.cache_protected_len = prefix_len 用
+```
+
+> **每一行用途不同**:
+> - `real_input_tokens` 算「还要算多少 token」——`extend_input_len` 已经扣过 device 命中,再扣 host 命中
+> - `prefix_len` 算「device 上已经占了多少 slot」——决定 KV cache 保护边界
+
+#### host 命中什么时候变成 device 命中
+
+紧接着 `add_one_req` 后面(`schedule_policy.py:830`):
+
+```python
+if req.host_hit_length > 0:
+    new_indices, req.last_node = self.tree_cache.init_load_back(...)   # ★ host→device DMA
+    req.prefix_indices = torch.cat([req.prefix_indices, new_indices])  # 合并到 device 索引
+    req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+    prefix_len = len(req.prefix_indices)                                # ← 现在变成 1074
+    req.cache_protected_len = prefix_len
+```
+
+`init_load_back` 内部从 host RAM 把 KV 拷回 GPU,新分配的 device slot 索引拼到 `prefix_indices` 后面。**load-back 之后,attention kernel 不再区分「device 原生」和「host 拉回」**,统一看 `extend_prefix_lens = 1074`。
+
+#### 5.1.1 `req.host_hit_length` 是哪里赋值的
+
+整个生命周期里 `req.host_hit_length` 在 **两处**被设置,**两处都来自 `tree_cache.match_prefix()` 的返回值**:
+
+##### 位置 ①:`SchedulePolicy._compute_prefix_matches`(`schedule_policy.py:204-214`)
+
+scheduler 主循环每轮组 batch 之前批量做(用于排队优先级排序):
+
+```python
+for r in waiting_queue:
+    prefix_ids = r.origin_input_ids + r.output_ids
+    match_result = self.tree_cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(token_ids=prefix_ids, extra_key=...))
+    )
+    (r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length) = (
+        match_result.device_indices,
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.host_hit_length,           # ★ 第一次赋值
+    )
+```
+
+##### 位置 ②:`Req.init_next_round_input`(`schedule_batch.py:1002-1015`)
+
+`Scheduler.get_new_batch_prefill` 在 `scheduler.py:2559` 对**每个 req** 调一次 `req.init_next_round_input(self.tree_cache)`,再做最终匹配(因为前面 `_compute_prefix_matches` 之后,树可能被别的 req 改过,需要重新对齐):
+
+```python
+def init_next_round_input(self, tree_cache=None, ...):
+    self.fill_ids = self.origin_input_ids + self.output_ids
+    ...
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(token_ids=token_ids, ...))
+    )
+    (self.prefix_indices, self.last_node, self.last_host_node,
+     self.host_hit_length, self.mamba_branching_seqlen) = (
+        match_result.device_indices,
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.host_hit_length,           # ★ 第二次赋值(最终生效的)
+        ...,
+    )
+```
+
+**两处的差别**:
+- ① 是「整批 waiting_queue 的预 match」,目的是排序(LPM / DFS 等策略需要知道每个 req 的前缀长度)
+- ② 是「真正决定 admit 时用的 match」,**这次的结果才是后面 `add_one_req` 看到的值**
+
+> 初学者只需记住:**`host_hit_length` 的来源永远是 `tree_cache.match_prefix()` 的返回值**,具体由 `HiRadixCache.match_prefix` 算出来。
+
+##### `match_result.host_hit_length` 又是怎么算的
+
+源头在 `HiRadixCache.match_prefix`(`hiradix_cache.py:1239-1242`):
+
+```python
+host_hit_length = 0
+last_host_node = last_node
+while last_node.evicted:                            # 节点的 device KV 已被淘汰
+    host_hit_length += len(last_node.host_value)    # 但 host 上还有备份
+    last_node = last_node.parent
+```
+
+**算法**:从 device 匹配到的最深节点开始,**向 root 方向走**,遇到「device 已淘汰但 host 还有备份」(`node.evicted == True` 且 `node.host_value is not None`)的节点,把它的长度累加进 `host_hit_length`。一旦遇到既不在 device 也不在 host 的节点就停止。
+
+普通 `RadixCache`(无 HiCache)永远返回 `host_hit_length=0`(`radix_cache.py:1227`),所以**没开 HiCache 时,这个字段恒为 0**——这种情况下「单卡 device 命中」就是全部。
+
+#### 5.1.2 一句话区分两个字段
+
+> **`len(req.prefix_indices)` = device 命中数**(GPU 上现成的 KV slot 数);**`req.host_hit_length` = host 命中数**(在 RAM 里、等会儿 `init_load_back` 才拉回 GPU 的)。两者来源都是 `match_prefix` 的返回值,**数值上独立、叠加,不是同一个东西**——只有当 HiCache 未启用或恰好无额外命中时 `host_hit_length=0`,此时仅 `prefix_indices` 一项代表前缀。
+
+### 5.2 `_lock_node` 的双层锁机制——两次 `inc_lock_ref` 为什么必要
+
+T2 阶段有**两个 `inc_lock_ref` 调用**:
+
+```python
+with self._lock_node(req.last_node):       # ① 临时锁(护栏)
+    # ...各种容量检查、可能 return...
+    self.can_run_list.append(req)
+    self._req_inc_lock_ref(req)             # ② 长期锁(请求持有)
+```
+
+#### `_lock_node` 是 contextmanager,with 退出会自动 dec
+
+源码(`schedule_policy.py:664`):
+
+```python
+@contextmanager
+def _lock_node(self, last_node: TreeNode):
+    try:
+        self.tree_cache.inc_lock_ref(last_node)    # ← 进 with 时 +1
+        yield None
+    finally:
+        self.tree_cache.dec_lock_ref(last_node)    # ← 退出 with 时 -1(对称)
+```
+
+**净效果**:`with` 块内 `inc + dec = 0`。
+
+#### 两次 inc 的角色对比
+
+| | ① `_lock_node` 的 inc | ② `_req_inc_lock_ref` 的 inc |
+|---|---|---|
+| **作用域** | 仅 `with` 块内(几行代码) | **请求整个生命周期**(T2 → T7) |
+| **配对的 dec** | 块退出时 `finally` 自动 dec | T5 `cache_unfinished_req` 或 T7 `cache_finished_req` 里手动 dec |
+| **目的** | **临界区护栏**——防止"容量检查的几 μs 内"node 被 evict 抽走 | **持久锁**——只要请求活着,prefix 路径就不能被 evict |
+
+#### lock_ref 时间线
+
+```
+T1  match_prefix              node_X.lock_ref = 0
+T2  进入 with _lock_node      node_X.lock_ref = 1   ← ① 临时 +1
+        |
+        | 做容量检查
+        | 检查通过 → 调 _req_inc_lock_ref(req)
+        | node_X.lock_ref = 2  ← ② 长期 +1
+        |
+T2  退出 with                  node_X.lock_ref = 1   ← ① 临时 -1 配对完成,长期锁仍在
+        |
+T3-T6 整个请求生命周期         node_X.lock_ref = 1   ← 持久保护
+        |
+T5  cache_unfinished_req      切换 last_node → node_Y(锁跟着搬,详见 §八)
+T7  cache_finished_req        dec_lock_ref(node_Y) → 一路 dec 到 root
+                              所有 ancestor 节点 lock_ref 归零
+```
+
+#### 为什么不能只用 ② 长期锁
+
+如果省去 ① 只留 ②,任何在 ② 之前的提前 return / exception 都会**导致泄漏**(请求没被 admit,但也没人去 dec)。`_lock_node` 用 `with` + `try/finally` 提供**异常安全**:
+
+```python
+with self._lock_node(req.last_node):
+    if not_enough_memory:
+        return AddReqResult.NO_TOKEN   # ← 提前 return,finally 跑 dec,锁干净释放
+    if some_assert_fails:
+        raise ...                       # ← 抛异常,finally 跑 dec
+
+    self._req_inc_lock_ref(req)         # ← 只有走到这一行,临时锁才"升级"成长期锁
+```
+
+**关键不变量**:**只有当代码走到 `_req_inc_lock_ref(req)` 这行,才升级成长期锁**——之前任何路径(return / exception),① + finally 的净效果都是 0,不会泄漏。
+
+### 5.3 `inc_lock_ref` 触发的链路(`radix_cache.py:637`):
 
 ```python
 def inc_lock_ref(self, node):  # node = node_X
@@ -419,25 +623,194 @@ evictable_size_:    1024 → 0
 protected_size_:    0   → 1024
 ```
 
-### 接下来:`req.req_pool_idx` 的分配
+### 5.4 接下来:`req.req_pool_idx` 的分配
 
-`PrefillAdder` 把 req 加入 `can_run_list` 后,主循环里 `Scheduler.get_new_batch_prefill()` 调用 `ReqToTokenPool.alloc()`:
+`PrefillAdder` 把 req 加入 `can_run_list` 后,主循环里 `Scheduler.get_new_batch_prefill()` 调用 `ReqToTokenPool.alloc()`(`memory_pool.py:156`)。这一步既简单又关键,先把这个池子的整体结构搞清楚。
+
+#### 5.4.1 `ReqToTokenPool` 是什么样的数据结构
+
+类定义在 `memory_pool.py:127`,**整个池子只有两个核心字段**:
 
 ```python
-# memory_pool.py: ReqToTokenPool.alloc
-def alloc(self, reqs):
-    need_size = len(reqs) - len(reusing)
-    select_index = self.free_slots[:need_size]
-    self.free_slots = self.free_slots[need_size:]
-    for r in reqs:
-        if r.req_pool_idx is None:
-            r.req_pool_idx = select_index[offset]    # ★ 分配 req_pool_idx
-            offset += 1
+class ReqToTokenPool:
+    def __init__(self, size, max_context_len, device, ...):
+        self.size = size                                       # 池子最多能装多少个 req
+        self.max_context_len = max_context_len                 # 每个 req 最多支持多长上下文
+        self.device = device
+
+        self.req_to_token = torch.zeros(                       # ★ 主存储:二维查表
+            (size, max_context_len), dtype=torch.int32, device=device
+        )
+        self.free_slots = list(range(size))                    # ★ 空闲行号列表
 ```
 
-这一步 `req.req_pool_idx` 被赋值(假设拿到 5),`req_to_token_pool.req_to_token[5]` 是一行长度 `max_context_len` 的 int 数组,**这一行就是「请求 R 用了哪些物理 KV slot」的映射表**。
+##### `self.req_to_token` —— 「**req idx → 它的每个 token 在 KV 池的物理 slot 编号**」二维查表
 
-### 紧接着:把命中的前缀 slot 写进映射表
+```
+形状: [size, max_context_len]    例如 [4096, 32768]
+dtype: int32
+device: cuda
+
+视图:
+                        token 位置 0  1  2  3  4  5  ...  max_context_len-1
+                                 ┌──┬──┬──┬──┬──┬──┬───┬──┐
+   req_to_token[0]:  req slot 0 │  │  │  │  │  │  │   │  │
+   req_to_token[1]:  req slot 1 │  │  │  │  │  │  │   │  │
+   req_to_token[2]:  req slot 2 │  │  │  │  │  │  │   │  │
+   ...
+   req_to_token[5]:  req slot 5 │100│101│..│1123│2000│..│..│  ← R 的映射:第 0 个 token
+                                 └──┴──┴──┴──┴──┴──┴───┴──┘     对应物理 KV slot 100,
+                                                                  第 1 个对应 101,...
+```
+
+**每一行就是一个 req 的「token → 物理 KV slot」映射表**。形状 `[size, max_context_len]` = `[池子容量, 单个 req 最大 token 数]`,典型 size=4096 / max_context_len=32k → 4096×32768×4B ≈ 512 MB。
+
+##### `self.free_slots` —— 「**池子里哪几行是空的**」
+
+```
+初始: [0, 1, 2, 3, 4, ..., size-1]      所有行都空着
+alloc 后: 从前面取 → free_slots[i:]    例如 alloc 5 行,变成 [5, 6, ..., size-1]
+free 后:  append 到末尾 → free_slots+[id]  归还的行号加回去
+```
+
+是个 **Python list**(不是 set),**FIFO 复用顺序**(先 alloc 的行先归还、先归还的先复用)。`available_size() = len(self.free_slots)`。
+
+#### 5.4.2 `alloc` 源码逐行解释
+
+```python
+def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
+    # ① 找出 batch 里「已经持有 req_pool_idx」的请求 —— 它们不需要新分配
+    reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+    # 注意:这里 reusing 存的是 reqs 列表里的 **下标** (0/1/2/...),不是 req_pool_idx 本身
+
+    # ② 断言:只有「chunked prefill 中途继续」或「decode 已经committed KV」的 req 才允许复用
+    assert all(
+        reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
+    ), "reusing request must be chunked or have committed KV"
+
+    # ③ 真正需要新分配的请求数
+    need_size = len(reqs) - len(reusing)
+
+    # ④ 容量不够,失败
+    if need_size > len(self.free_slots):
+        return None
+
+    # ⑤ 从空闲池前面拿 need_size 个行号
+    select_index = self.free_slots[:need_size]
+    self.free_slots = self.free_slots[need_size:]     # 把这几个从空闲池移除
+
+    # ⑥ 给那些 req_pool_idx 为 None 的请求逐个赋值
+    offset = 0
+    for r in reqs:
+        if r.req_pool_idx is None:
+            r.req_pool_idx = select_index[offset]
+            offset += 1
+    return [r.req_pool_idx for r in reqs]
+```
+
+#### 5.4.3 三个关键概念详解
+
+**① `reusing` 是什么**
+
+「**已经有 req_pool_idx 的 req 的下标列表**」。什么场景会出现?
+
+- **chunked prefill 跨 chunk 继续**:R 第一轮跑了前 5000 个 token,scheduler 把它存在 waiting_queue 等下一轮跑剩下的 5000 个,**req_pool_idx 一直保留**(已分配过)。下一轮 `alloc()` 看到 `r.req_pool_idx is not None`,直接复用同一行,不重新分配
+- **decode 阶段** 其实不再调 `alloc()`(req 在 prefill 时已经拿到 row),但 chunked prefill 是个混合状态,需要这种"中途复用"
+- **某些 disagg 模式**:从 prefill 实例传过来的 req 可能已经预填好 req_pool_idx
+
+> **直观理解**:`reusing` = "这一批里有几个 req 已经占着 req_to_token 的某一行了,本次不用再给它们找位置"。
+
+**② `need_size` 代表什么**
+
+```
+need_size = len(reqs) - len(reusing)
+         = "本批 req 总数" - "已经占着行的 req 数"
+         = "真正需要新分配的行数"
+```
+
+举例:本批 8 个 req,其中 2 个是 chunked-prefill 续接(已有 req_pool_idx),→ `need_size = 6`,只用从 `free_slots` 取 6 个新行号。
+
+**③ `self.free_slots` 的作用**
+
+它是 **"行号空闲池"**——`req_to_token` 那张大表里**有 size 行,哪些行没人用,哪些行被占了**,就靠这个 list 维护:
+
+```
+              ┌────────────┐
+              │ req_to_token │  shape: [size=4096, max_context_len=32768]
+              │ (整张大表)   │
+              └────────────┘
+                    │
+                    ↓ free_slots 记录"未被占用"的行号
+              [3, 8, 17, 22, 88, ..., 4095]
+                ↑
+                alloc(...) 从这里取走 → 这些行就归请求所有了
+                free(req)  把行号还回来 → 行可被下一个请求复用
+```
+
+**注意**:`free()` 之后 `req_to_token[req_pool_idx]` 那一行**数据不清零**——下次复用前 `alloc` 也不清零,等到新 req 写进自己的 prefix_indices / out_cache_loc 时直接覆盖。"行内容"是垃圾,但**反正只有当前持有者会去读它**,无所谓。
+
+#### 5.4.4 完整数据流总览
+
+```
+ReqToTokenPool 池
+  ├─ self.req_to_token        ← 二维大表 [size, max_context_len] int32 on GPU
+  │     ├─ row 0  [_______________________...]
+  │     ├─ row 1  [_______________________...]
+  │     ├─ row 2  [100, 101, ..., 1123, 2000, ..., 2099, _____...]  ← R 用了 row 2 (req_pool_idx=2)
+  │     ├─ row 3  [_______________________...]
+  │     ├─ row 4  [5000, 5001, ..., 5500, _____...]                   ← 别的请求 R' 用了 row 4
+  │     ├─ ...
+  │     └─ row size-1
+  │
+  └─ self.free_slots          ← Python list,记录哪些 row 空着
+        例如 [3, 5, 6, 7, ..., size-1]   (0, 1, 2, 4 已被占用)
+
+
+alloc / free 的工作循环:
+                   ┌───── PrefillAdder admit 请求 ────┐
+                   │ ReqToTokenPool.alloc(reqs)        │
+                   │   1. 看哪些 req 已有 req_pool_idx │
+                   │   2. need_size = 总数 - 已有的    │
+                   │   3. 从 free_slots[:need_size] 取 │
+                   │   4. 把 req.req_pool_idx 设上     │
+                   └───────────────────────────────────┘
+                              │
+                              ↓
+                   ┌───── 请求活着的整个生命周期 ─────┐
+                   │ req_to_token[req_pool_idx] 装着  │
+                   │ 这个请求每个 token 的物理 KV 索引 │
+                   │  - prefix 部分 = node_X 的 slot   │
+                   │  - extend 部分 = 新分配的 slot    │
+                   │  - decode 时每步追加 1 个新 slot  │
+                   └───────────────────────────────────┘
+                              │
+                              ↓
+                   ┌───── 请求结束 cache_finished_req ┐
+                   │ ReqToTokenPool.free(req)         │
+                   │   self.free_slots.append(...)    │
+                   │   req.req_pool_idx = None        │
+                   └───────────────────────────────────┘
+```
+
+#### 5.4.5 我们的例子(R 拿到 req_pool_idx=5)
+
+```
+alloc 之前:
+  free_slots = [5, 12, 17, 88, ..., size-1]      (假设 0-4 都被占了)
+  req_to_token[5] = [全 0]                       (空闲行内容是垃圾)
+
+alloc 之后:
+  reusing = []                                   (R 是新来的)
+  need_size = 1
+  select_index = [5]
+  free_slots = [12, 17, 88, ..., size-1]         (5 被取出)
+  R.req_pool_idx = 5
+  req_to_token[5] 还是全 0(下一步 prepare_for_extend 才写)
+```
+
+**这一步只是「占了一行,记下行号」,行内容还没填**。下一节 §5.5 才把 prefix slot 索引和新分配的 extend slot 索引写进 `req_to_token[5]`。
+
+### 5.5 紧接着:把命中的前缀 slot 写进映射表
 
 `prepare_for_extend` 阶段(`schedule_batch.py:1600+`),把 `req.prefix_indices` 拷到 `req_to_token_pool.req_to_token[req_pool_idx]` 的前 1024 行:
 
@@ -448,7 +821,7 @@ req_to_token_pool.req_to_token[5][0:1024] = req.prefix_indices  # 1024 个 slot 
 
 **这一刻 R 的 req_to_token 表前 1024 个槽位指向 node_X 的物理 slot**——R 和"已经离开的 R1"实际上**共享了同一份 KV 数据**,零拷贝。
 
-### 同时:为 100 个新 token 分配新物理 slot
+### 5.6 同时:为 100 个新 token 分配新物理 slot
 
 ```python
 # token_to_kv_pool_allocator.alloc(100)
@@ -458,7 +831,7 @@ req_to_token_pool.req_to_token[5][1024:1124] = new_slots
 
 `req.fill_ids` 也被设好:`fill_ids = origin_input_ids + output_ids = [A,B,C,...,X1, Y1,...,Y100]`,长度 1124。
 
-### 关键变量快照(T2)
+### 5.7 关键变量快照(T2)
 
 ```
 req.req_pool_idx        = 5
